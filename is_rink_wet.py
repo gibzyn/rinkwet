@@ -431,11 +431,13 @@ try:
         )
 
 except Exception as e:
-    st.warning(
-        "Feedback system isn't connected yet. "
-        "Make sure Streamlit Secrets contain gcp_service_account + sheet_id, "
-        "and your service account is shared as Editor on the sheet."
-    )
-    st.caption(f"Feedback debug: {e}")
+    st.error("Feedback system isn't connected yet.")
+    st.write("**Debug checks (safe):**")
+    st.write({
+        "has_gcp_service_account": "gcp_service_account" in st.secrets,
+        "has_sheet_id": "sheet_id" in st.secrets,
+        "sheet_id_len": len(st.secrets["sheet_id"]) if "sheet_id" in st.secrets else None,
+    })
+    st.write("**Exact error (safe):**")
+    st.code(f"{type(e).__name__}: {e}")
 
-st.caption("Disclaimer: Forecast-based estimate only. Outdoor surfaces can vary by shade, irrigation, and microclimate.")
