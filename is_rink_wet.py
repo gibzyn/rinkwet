@@ -440,5 +440,9 @@ except Exception as e:
     })
     st.write("**Exact error (safe):**")
     st.code(f"{type(e).__name__}: {e}")
+    st.divider()
+st.caption("Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, shade, drainage, or microclimate. Use at your own risk.")
+
+
 
 
