@@ -1,46 +1,104 @@
 import math
+import os
+import csv
 from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Is the rink wet?", page_icon="🛼", layout="centered")
+st.set_page_config(page_title="RinkWet", page_icon="🛼", layout="centered")
 
-# Freedom Park Inline Hockey Arena (default)
+# ----------------------------
+# Defaults
+# ----------------------------
 DEFAULT_LABEL = "Freedom Park Inline Hockey Arena (Camarillo)"
 DEFAULT_LAT = 34.2138
 DEFAULT_LON = -119.0856
 
-# Open-Meteo typical horizon varies; 16 is a safe cap
-MAX_FORECAST_DAYS = 16
+OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
+
+MAX_FORECAST_DAYS = 16  # safe cap
+
+# Local feedback file (desktop/local)
+FEEDBACK_FILE = "feedback.csv"
 
 
+# ----------------------------
+# Feedback helpers (local CSV)
+# ----------------------------
+def save_feedback(verdict: str, score: int, label: str, target_iso: str, thumbs: str):
+    """
+    thumbs: 'up' or 'down'
+    Writes one row to feedback.csv (local file).
+    """
+    file_exists = os.path.exists(FEEDBACK_FILE)
+    with open(FEEDBACK_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not file_exists:
+            w.writerow(["ts_utc", "label", "target_time", "verdict", "score", "thumbs"])
+        w.writerow(
+            [
+                datetime.utcnow().isoformat(timespec="seconds"),
+                label,
+                target_iso,
+                verdict,
+                score,
+                thumbs,
+            ]
+        )
+
+
+def load_feedback_stats():
+    if not os.path.exists(FEEDBACK_FILE):
+        return {"total": 0, "up": 0, "down": 0, "accuracy": None}
+
+    up = down = total = 0
+    with open(FEEDBACK_FILE, "r", newline="", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            total += 1
+            if row.get("thumbs") == "up":
+                up += 1
+            elif row.get("thumbs") == "down":
+                down += 1
+
+    accuracy = (up / total) * 100 if total else None
+    return {"total": total, "up": up, "down": down, "accuracy": accuracy}
+
+
+# ----------------------------
+# Weather + computation
+# ----------------------------
 def geocode(query: str):
-    url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {"name": query, "count": 5, "language": "en", "format": "json"}
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(
+        OPEN_METEO_GEOCODE,
+        params={"name": query, "count": 5, "language": "en", "format": "json"},
+        timeout=15,
+    )
     r.raise_for_status()
     return (r.json().get("results") or [])
 
 
 def fetch_weather(lat: float, lon: float, forecast_days: int = 2):
     """
-    IMPORTANT FIX:
-    - Do NOT include 'time' in the hourly variable list. Open-Meteo returns hourly['time'] automatically.
-    - Keep 'current' + 'hourly' variable lists conservative to avoid 400 errors.
+    IMPORTANT: Do NOT include 'time' inside hourly variable list.
+    Open-Meteo returns hourly['time'] automatically.
     """
     forecast_days = max(1, min(MAX_FORECAST_DAYS, int(forecast_days)))
 
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
-        "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m",
-        "forecast_days": forecast_days,
-        "timezone": "auto",
-    }
-    r = requests.get(url, params=params, timeout=15)
+    r = requests.get(
+        OPEN_METEO_FORECAST,
+        params={
+            "latitude": lat,
+            "longitude": lon,
+            "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
+            "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m",
+            "forecast_days": forecast_days,
+            "timezone": "auto",
+        },
+        timeout=15,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -56,20 +114,37 @@ def compute_dewpoint_c(temp_c: float, rh: float):
     return (b * gamma) / (a - gamma)
 
 
+def hourly_at(hourly: dict, key: str, idx: int):
+    arr = (hourly or {}).get(key) or []
+    return arr[idx] if 0 <= idx < len(arr) else None
+
+
+def pick_hour_index(hourly_times: list[str], target_dt: datetime) -> int:
+    if not hourly_times:
+        return 0
+    dts = [datetime.fromisoformat(t) for t in hourly_times]
+    return min(range(len(dts)), key=lambda i: abs((dts[i] - target_dt).total_seconds()))
+
+
+def needed_forecast_days_for(target_dt: datetime) -> int:
+    today = datetime.now().date()
+    delta_days = (target_dt.date() - today).days
+    return max(1, min(MAX_FORECAST_DAYS, delta_days + 2))
+
+
 def wet_assess(temp_f, dew_f, rh, wind_mph, precip_mm_hr):
     """
-    Heuristic tuned for outdoor sport-court surfaces.
     Returns: (verdict_str, score_int, reasons_list)
     """
     reasons = []
     score = 0
 
-    # Precipitation overrides: if it's raining, it's wet.
+    # Precip = wet
     if precip_mm_hr is not None and precip_mm_hr > 0:
         score += 55
-        reasons.append(f"Active precipitation (~{precip_mm_hr:.1f} mm/hr) strongly suggests a wet surface.")
+        reasons.append(f"Active precipitation (~{precip_mm_hr:.2f} mm/hr) strongly suggests a wet surface.")
 
-    # Dew/condensation: driven by temp - dewpoint spread
+    # Dew/condensation risk
     if temp_f is not None and dew_f is not None:
         spread = temp_f - dew_f
         if spread <= 2:
@@ -98,7 +173,7 @@ def wet_assess(temp_f, dew_f, rh, wind_mph, precip_mm_hr):
             score -= 6
             reasons.append(f"Humidity is moderate/low ({rh:.0f}%), helping the surface stay drier.")
 
-    # Wind helps drying
+    # Wind dries
     if wind_mph is not None:
         if wind_mph >= 10:
             score -= 14
@@ -119,43 +194,11 @@ def wet_assess(temp_f, dew_f, rh, wind_mph, precip_mm_hr):
     return verdict, score, reasons
 
 
-def verdict_from_score(s: int):
-    if s >= 65:
-        return "YES — likely wet"
-    elif s >= 45:
-        return "MAYBE — likely damp/borderline"
-    else:
-        return "NO — likely dry"
-
-
-def hourly_at(hourly: dict, key: str, idx: int):
-    arr = (hourly or {}).get(key) or []
-    return arr[idx] if 0 <= idx < len(arr) else None
-
-
-def pick_hour_index(hourly_times: list[str], target_dt: datetime) -> int:
-    """
-    Pick the closest hourly forecast time to target_dt.
-    Note: hourly_times comes from Open-Meteo as ISO strings (local timezone since timezone=auto).
-    """
-    if not hourly_times:
-        return 0
-    dts = [datetime.fromisoformat(t) for t in hourly_times]
-    return min(range(len(dts)), key=lambda i: abs((dts[i] - target_dt).total_seconds()))
-
-
-def needed_forecast_days_for(target_dt: datetime) -> int:
-    """
-    Ask for enough days to cover the chosen date (within max horizon).
-    """
-    today = datetime.now().date()
-    delta_days = (target_dt.date() - today).days
-    return max(1, min(MAX_FORECAST_DAYS, delta_days + 2))
-
-
-# ---------- UI ----------
-st.title("🛼 Is the rink wet?")
-st.caption("Freedom Park default. Check now (arrival minutes) or pick a future date/time (within forecast range).")
+# ----------------------------
+# UI
+# ----------------------------
+st.title("🛼 RinkWet")
+st.caption("Forecast-based estimate for wet rink conditions (dew/condensation + rain + wind).")
 
 mode = st.radio("Check for", ["Now (arrival in X minutes)", "Pick a date & time"], horizontal=True)
 
@@ -177,6 +220,12 @@ else:
     target_dt = datetime.combine(d, t)
 
 st.caption(f"Target time: {target_dt.strftime('%Y-%m-%d %H:%M')} (local)")
+
+
+# Keep these in session state so feedback can reference last result
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+
 
 if st.button("Check"):
     try:
@@ -203,8 +252,6 @@ if st.button("Check"):
         wx = fetch_weather(lat, lon, forecast_days=forecast_days)
         current = wx.get("current") or {}
         hourly = wx.get("hourly") or {}
-
-        # Open-Meteo returns hourly['time'] automatically (we do NOT request it in hourly=)
         times = hourly.get("time") or []
 
         # NOW (current)
@@ -226,11 +273,9 @@ if st.button("Check"):
         if precip_mm_now is None:
             precip_mm_now = hourly_at(hourly, "precipitation", i_now)
 
-        verdict_now, score_now, _ = wet_assess(
-            temp_f_now, dew_f_now, rh_now, wind_mph_now, precip_mm_now
-        )
+        verdict_now, score_now, _ = wet_assess(temp_f_now, dew_f_now, rh_now, wind_mph_now, precip_mm_now)
 
-        # TARGET (hourly forecast at chosen date/time)
+        # TARGET (hourly)
         i = pick_hour_index(times, target_dt) if times else 0
 
         temp_c_t = hourly_at(hourly, "temperature_2m", i)
@@ -246,9 +291,15 @@ if st.button("Check"):
         dew_f_t = c_to_f(dew_c_t)
         wind_mph_t = None if wind_kmh_t is None else wind_kmh_t * 0.621371
 
-        verdict_t, score_t, reasons_t = wet_assess(
-            temp_f_t, dew_f_t, rh_t, wind_mph_t, precip_mm_t
-        )
+        verdict_t, score_t, reasons_t = wet_assess(temp_f_t, dew_f_t, rh_t, wind_mph_t, precip_mm_t)
+
+        # Save for feedback
+        st.session_state.last_result = {
+            "label": label,
+            "target_iso": target_dt.strftime("%Y-%m-%d %H:%M"),
+            "verdict": verdict_t,
+            "score": score_t,
+        }
 
         # Display
         st.subheader(f"📍 {label}")
@@ -293,10 +344,42 @@ if st.button("Check"):
             st.write(f"- {r}")
 
         if times:
-            st.caption(f"Target forecast hour used: {times[i]} (index {i}), forecast_days requested: {forecast_days}")
+            st.caption(f"Target forecast hour used: {times[i]} (index {i})")
 
     except requests.RequestException as e:
         st.error(f"Network/API error: {e}")
-
     except Exception as e:
         st.error(f"App error: {e}")
+
+
+# ----------------------------
+# Feedback UI (shows even without re-check)
+# ----------------------------
+st.divider()
+st.subheader("✅ Was the prediction accurate?")
+
+stats = load_feedback_stats()
+c1, c2, c3 = st.columns(3)
+c1.metric("Total votes", stats["total"])
+c2.metric("👍", stats["up"])
+c3.metric("Accuracy", "—" if stats["accuracy"] is None else f"{stats['accuracy']:.0f}%")
+
+last = st.session_state.last_result
+if not last:
+    st.info("Run a check first, then vote 👍 or 👎 based on what you actually saw at the rink.")
+else:
+    left, right = st.columns(2)
+
+    if left.button("👍 Accurate"):
+        save_feedback(last["verdict"], last["score"], last["label"], last["target_iso"], "up")
+        st.success("Thanks — logged 👍")
+
+    if right.button("👎 Not accurate"):
+        save_feedback(last["verdict"], last["score"], last["label"], last["target_iso"], "down")
+        st.warning("Logged 👎")
+
+    st.caption(f"Last check: {last['label']} @ {last['target_iso']} → {last['verdict']} ({last['score']}/100)")
+
+
+# Footer / disclaimer
+st.caption("Disclaimer: Forecast-based estimate only. Outdoor surfaces can vary by shade, irrigation, and microclimate.")
