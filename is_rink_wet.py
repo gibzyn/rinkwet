@@ -1,5 +1,6 @@
 # is_rink_wet.py
 import math
+import urllib.parse
 from datetime import datetime, timedelta
 
 import requests
@@ -22,6 +23,7 @@ OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 
 MAX_FORECAST_DAYS = 16
+APP_URL = "https://rinkwet.streamlit.app/"
 
 # ----------------------------
 # Google Sheets feedback
@@ -31,21 +33,18 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+
 @st.cache_resource
 def get_worksheet():
     """
     Uses Streamlit Secrets:
-      - st.secrets["gcp_service_account"]  (JSON string OR dict)
+      - st.secrets["gcp_service_account"]  (dict from TOML secrets)
       - st.secrets["sheet_id"]             (Google Sheet ID)
     Returns a worksheet, preferring tab name 'feedback', then 'Sheet1', else first tab.
     """
-    import json
-
-    sa_info = st.secrets["gcp_service_account"]
-    if isinstance(sa_info, str):
-        sa_info = json.loads(sa_info)
-
+    sa_info = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(st.secrets["sheet_id"])
 
@@ -72,8 +71,7 @@ def ensure_header():
 
     header = values[0]
     if [h.strip() for h in header] != expected:
-        # Don't overwrite user's sheet; just append a note header if mismatched
-        # But best practice is to match the expected header row.
+        # Don't overwrite user's sheet. If you want, manually set your header row to match.
         pass
 
 
@@ -247,7 +245,11 @@ def wet_assess(temp_f, dew_f, rh, wind_mph, precip_mm_hr):
 st.title("🛼 RinkWet")
 st.caption("Forecast-based estimate for wet rink conditions (dew/condensation + rain + wind).")
 
-st.markdown(
+with st.expander("📣 Share this app"):
+    st.write("Send this link to teammates:")
+    st.code(APP_URL, language="")
+
+    st.markdown(
         f"""
         <button onclick="navigator.clipboard.writeText('{APP_URL}')"
         style="padding:10px 14px;border-radius:10px;border:1px solid #555;background:#111;color:#fff;cursor:pointer;">
@@ -257,12 +259,10 @@ st.markdown(
         unsafe_allow_html=True,
     )
 
-    # QR code via public image endpoint (no extra packages needed)
     qr_url = "https://api.qrserver.com/v1/create-qr-code/?" + urllib.parse.urlencode(
         {"size": "220x220", "data": APP_URL}
     )
     st.image(qr_url, caption="Scan to open RinkWet")
-
 
 mode = st.radio("Check for", ["Now (arrival in X minutes)", "Pick a date & time"], horizontal=True)
 
@@ -374,7 +374,7 @@ if st.button("Check"):
         cols[2].metric("Humidity", "—" if rh_now is None else f"{rh_now:.0f}%")
         cols[3].metric("Wind", "—" if wind_mph_now is None else f"{wind_mph_now:.1f} mph")
 
-        st.write(f"**Target (nearest hourly forecast)**")
+        st.write("**Target (nearest hourly forecast)**")
         cols2 = st.columns(4)
         cols2[0].metric("Temp", "—" if temp_f_t is None else f"{temp_f_t:.1f}°F")
         cols2[1].metric("Dew point", "—" if dew_f_t is None else f"{dew_f_t:.1f}°F")
@@ -433,6 +433,7 @@ try:
         st.info("Run a check first, then vote 👍 or 👎 based on what you actually saw at the rink.")
     else:
         col1, col2 = st.columns(2)
+
         if col1.button("👍 Accurate"):
             append_vote(last["label"], last["target_iso"], last["verdict"], last["score"], "up")
             refresh_stats()
@@ -441,28 +442,21 @@ try:
         if col2.button("👎 Not accurate"):
             append_vote(last["label"], last["target_iso"], last["verdict"], last["score"], "down")
             refresh_stats()
-            st.warning("✅ Feedback recorded — thank you!")
+            st.success("✅ Feedback recorded — thank you!")
 
         st.caption(
             f"Last check: {last['label']} @ {last['target_iso']} → {last['verdict']} ({last['score']}/100)"
         )
 
-except Exception as e:
-    st.error("Feedback system isn't connected yet.")
-    st.write("**Debug checks (safe):**")
-    st.write({
-        "has_gcp_service_account": "gcp_service_account" in st.secrets,
-        "has_sheet_id": "sheet_id" in st.secrets,
-        "sheet_id_len": len(st.secrets["sheet_id"]) if "sheet_id" in st.secrets else None,
-    })
-    st.write("**Exact error (safe):**")
-    st.code(f"{type(e).__name__}: {e}")
-    st.divider()
-st.caption("Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, shade, drainage, or microclimate. Use at your own risk.")
+except Exception:
+    st.warning(
+        "Feedback system isn't connected yet. "
+        "Make sure Streamlit Secrets contain gcp_service_account + sheet_id, "
+        "and your service account is shared as Editor on the sheet."
+    )
 
-
-
-
-
-
-
+st.divider()
+st.caption(
+    "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
+    "shade, drainage, or microclimate. Use at your own risk."
+)
