@@ -1,7 +1,9 @@
 # is_rink_wet.py
 import math
+import json
 import urllib.parse
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
@@ -10,7 +12,18 @@ import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
 
+
+# ----------------------------
+# Timezone (force rink local time)
+# ----------------------------
+RINK_TZ = ZoneInfo("America/Los_Angeles")  # PST/PDT automatically
+
+
+# ----------------------------
+# Streamlit setup
+# ----------------------------
 st.set_page_config(page_title="RinkWet", page_icon="🛼", layout="centered")
+
 
 # ----------------------------
 # Defaults
@@ -23,7 +36,7 @@ OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 
 MAX_FORECAST_DAYS = 16
-APP_URL = "https://rinkwet.streamlit.app/"
+
 
 # ----------------------------
 # Google Sheets feedback
@@ -38,13 +51,15 @@ SCOPES = [
 def get_worksheet():
     """
     Uses Streamlit Secrets:
-      - st.secrets["gcp_service_account"]  (dict from TOML secrets)
+      - st.secrets["gcp_service_account"]  (JSON string OR TOML dict)
       - st.secrets["sheet_id"]             (Google Sheet ID)
     Returns a worksheet, preferring tab name 'feedback', then 'Sheet1', else first tab.
     """
-    sa_info = dict(st.secrets["gcp_service_account"])
-    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+    sa_info = st.secrets["gcp_service_account"]
+    if isinstance(sa_info, str):
+        sa_info = json.loads(sa_info)
 
+    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(st.secrets["sheet_id"])
 
@@ -59,27 +74,28 @@ def get_worksheet():
 def ensure_header():
     """
     Ensures the first row has the expected headers.
-    Expected: ts_utc,label,target_time,verdict,score,thumbs
+    Expected: ts_utc,label,target_time_local,verdict,score,thumbs
     """
     ws = get_worksheet()
     values = ws.get_all_values()
-    expected = ["ts_utc", "label", "target_time", "verdict", "score", "thumbs"]
+    expected = ["ts_utc", "label", "target_time_local", "verdict", "score", "thumbs"]
 
     if not values:
         ws.append_row(expected, value_input_option="RAW")
         return
 
-    header = values[0]
-    if [h.strip() for h in header] != expected:
-        # Don't overwrite user's sheet. If you want, manually set your header row to match.
+    header = [h.strip() for h in values[0]]
+    if header != expected:
+        # Don't overwrite user sheet automatically; just leave it.
+        # If you want strict enforcement, delete row 1 and re-add.
         pass
 
 
-def append_vote(label: str, target_iso: str, verdict: str, score: int, thumbs: str):
+def append_vote(label: str, target_local: str, verdict: str, score: int, thumbs: str):
     ensure_header()
     ws = get_worksheet()
     ts_utc = datetime.utcnow().isoformat(timespec="seconds")
-    ws.append_row([ts_utc, label, target_iso, verdict, int(score), thumbs], value_input_option="RAW")
+    ws.append_row([ts_utc, label, target_local, verdict, int(score), thumbs], value_input_option="RAW")
 
 
 @st.cache_data(ttl=30)
@@ -130,8 +146,8 @@ def geocode(query: str):
 
 def fetch_weather(lat: float, lon: float, forecast_days: int):
     """
-    IMPORTANT: Do NOT include 'time' inside hourly param list.
-    Open-Meteo returns hourly['time'] automatically.
+    Force Open-Meteo to return hourly times in America/Los_Angeles so they match your rink local time.
+    IMPORTANT: Do NOT include 'time' inside hourly param list (Open-Meteo returns it automatically).
     """
     forecast_days = max(1, min(MAX_FORECAST_DAYS, int(forecast_days)))
 
@@ -143,7 +159,8 @@ def fetch_weather(lat: float, lon: float, forecast_days: int):
             "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
             "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m",
             "forecast_days": forecast_days,
-            "timezone": "auto",
+            # THIS is the key: make the API give times in rink-local TZ
+            "timezone": "America/Los_Angeles",
         },
         timeout=15,
     )
@@ -167,16 +184,30 @@ def hourly_at(hourly: dict, key: str, idx: int):
     return arr[idx] if 0 <= idx < len(arr) else None
 
 
-def pick_hour_index(hourly_times: list[str], target_dt: datetime) -> int:
-    if not hourly_times:
+def parse_hourly_times(times: list[str]):
+    """
+    Open-Meteo with timezone=America/Los_Angeles returns times like '2026-01-30T08:00'
+    (no offset). We interpret those as rink-local timezone-aware datetimes.
+    """
+    out = []
+    for t in times or []:
+        dt_naive = datetime.fromisoformat(t)  # naive
+        out.append(dt_naive.replace(tzinfo=RINK_TZ))
+    return out
+
+
+def pick_hour_index(hourly_times_local: list[datetime], target_dt_local: datetime) -> int:
+    if not hourly_times_local:
         return 0
-    dts = [datetime.fromisoformat(t) for t in hourly_times]
-    return min(range(len(dts)), key=lambda i: abs((dts[i] - target_dt).total_seconds()))
+    return min(
+        range(len(hourly_times_local)),
+        key=lambda i: abs((hourly_times_local[i] - target_dt_local).total_seconds()),
+    )
 
 
-def needed_forecast_days_for(target_dt: datetime) -> int:
-    today = datetime.now().date()
-    delta_days = (target_dt.date() - today).days
+def needed_forecast_days_for(target_dt_local: datetime) -> int:
+    today_local = datetime.now(RINK_TZ).date()
+    delta_days = (target_dt_local.date() - today_local).days
     return max(1, min(MAX_FORECAST_DAYS, delta_days + 2))
 
 
@@ -246,44 +277,36 @@ st.title("🛼 RinkWet")
 st.caption("Forecast-based estimate for wet rink conditions (dew/condensation + rain + wind).")
 
 with st.expander("📣 Share this app"):
-    st.write("Send this link to teammates:")
-    st.code(APP_URL, language="")
-
-    st.markdown(
-        f"""
-        <button onclick="navigator.clipboard.writeText('{APP_URL}')"
-        style="padding:10px 14px;border-radius:10px;border:1px solid #555;background:#111;color:#fff;cursor:pointer;">
-        📋 Copy link
-        </button>
-        """,
-        unsafe_allow_html=True,
-    )
+    # This avoids syntax errors and doesn’t rely on unknown APP_URL.
+    st.write("Copy your site URL from the browser address bar and share it.")
+    st.code("https://rinkwet.streamlit.app/", language="text")
 
     qr_url = "https://api.qrserver.com/v1/create-qr-code/?" + urllib.parse.urlencode(
-        {"size": "220x220", "data": APP_URL}
+        {"size": "220x220", "data": "https://rinkwet.streamlit.app/"}
     )
     st.image(qr_url, caption="Scan to open RinkWet")
+
 
 mode = st.radio("Check for", ["Now (arrival in X minutes)", "Pick a date & time"], horizontal=True)
 
 use_default = st.toggle("Use Freedom Park default", value=True)
 place = "" if use_default else st.text_input("Other location", placeholder="e.g., 'Ventura, CA'")
 
-today = datetime.now().date()
-max_day = today + timedelta(days=MAX_FORECAST_DAYS - 1)
+now_local = datetime.now(RINK_TZ)
+today_local = now_local.date()
+max_day = today_local + timedelta(days=MAX_FORECAST_DAYS - 1)
 
 if mode == "Now (arrival in X minutes)":
     arrival_min = st.slider("Arriving in (minutes)", 0, 180, 20, 5)
-    target_dt = datetime.now() + timedelta(minutes=arrival_min)
+    target_dt = now_local + timedelta(minutes=arrival_min)
 else:
-    d = st.date_input("Date", value=today, min_value=today, max_value=max_day)
-    t = st.time_input(
-        "Time",
-        value=(datetime.now() + timedelta(hours=1)).time().replace(second=0, microsecond=0),
-    )
-    target_dt = datetime.combine(d, t)
+    d = st.date_input("Date", value=today_local, min_value=today_local, max_value=max_day)
+    # default time: next full hour in rink local time
+    next_hour = (now_local + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    t = st.time_input("Time", value=next_hour.time())
+    target_dt = datetime.combine(d, t).replace(tzinfo=RINK_TZ)
 
-st.caption(f"Target time: {target_dt.strftime('%Y-%m-%d %H:%M')} (local)")
+st.caption(f"Target time (America/Los_Angeles): {target_dt.strftime('%Y-%m-%d %H:%M')}")
 
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
@@ -312,7 +335,13 @@ if st.button("Check"):
         wx = fetch_weather(lat, lon, forecast_days=forecast_days)
         current = wx.get("current") or {}
         hourly = wx.get("hourly") or {}
-        times = hourly.get("time") or []
+        times_raw = hourly.get("time") or []
+        times_local = parse_hourly_times(times_raw)
+
+        # Indexes
+        i_now = pick_hour_index(times_local, datetime.now(RINK_TZ)) if times_local else 0
+        i_t = pick_hour_index(times_local, target_dt) if times_local else 0
+        used_hour = times_raw[i_t] if times_raw else ""
 
         # NOW (current metrics + nearest hourly dew)
         temp_c_now = current.get("temperature_2m")
@@ -320,7 +349,6 @@ if st.button("Check"):
         wind_kmh_now = current.get("wind_speed_10m")
         precip_now = current.get("precipitation")
 
-        i_now = pick_hour_index(times, datetime.now()) if times else 0
         dew_c_now = hourly_at(hourly, "dew_point_2m", i_now)
         if dew_c_now is None and temp_c_now is not None and rh_now is not None:
             dew_c_now = compute_dewpoint_c(temp_c_now, rh_now)
@@ -330,17 +358,10 @@ if st.button("Check"):
         wind_mph_now = None if wind_kmh_now is None else wind_kmh_now * 0.621371
 
         verdict_now, score_now, _ = wet_assess(
-            temp_f_now,
-            dew_f_now,
-            rh_now,
-            wind_mph_now,
-            precip_now,
+            temp_f_now, dew_f_now, rh_now, wind_mph_now, precip_now
         )
 
         # TARGET (nearest hourly forecast)
-        i_t = pick_hour_index(times, target_dt) if times else 0
-        used_hour = times[i_t] if times else ""
-
         temp_c_t = hourly_at(hourly, "temperature_2m", i_t)
         rh_t = hourly_at(hourly, "relative_humidity_2m", i_t)
         wind_kmh_t = hourly_at(hourly, "wind_speed_10m", i_t)
@@ -354,12 +375,14 @@ if st.button("Check"):
         dew_f_t = c_to_f(dew_c_t)
         wind_mph_t = None if wind_kmh_t is None else wind_kmh_t * 0.621371
 
-        verdict_t, score_t, reasons_t = wet_assess(temp_f_t, dew_f_t, rh_t, wind_mph_t, precip_t)
+        verdict_t, score_t, reasons_t = wet_assess(
+            temp_f_t, dew_f_t, rh_t, wind_mph_t, precip_t
+        )
 
         # Save for feedback buttons
         st.session_state.last_result = {
             "label": label,
-            "target_iso": target_dt.strftime("%Y-%m-%d %H:%M"),
+            "target_local": target_dt.strftime("%Y-%m-%d %H:%M"),
             "verdict": verdict_t,
             "score": score_t,
         }
@@ -407,7 +430,14 @@ if st.button("Check"):
             st.write(f"- {r}")
 
         if used_hour:
-            st.caption(f"Target forecast hour used: {used_hour}")
+            st.caption(f"Target forecast hour used (America/Los_Angeles): {used_hour}")
+
+        # Optional: quick sanity debug (safe)
+        with st.expander("Debug (safe)"):
+            st.write("now_local:", datetime.now(RINK_TZ).strftime("%Y-%m-%d %H:%M %Z"))
+            st.write("target_dt:", target_dt.strftime("%Y-%m-%d %H:%M %Z"))
+            st.write("i_now:", i_now, "i_t:", i_t)
+            st.write("used_hour:", used_hour)
 
     except requests.RequestException as e:
         st.error(f"Network/API error: {e}")
@@ -433,30 +463,27 @@ try:
         st.info("Run a check first, then vote 👍 or 👎 based on what you actually saw at the rink.")
     else:
         col1, col2 = st.columns(2)
-
         if col1.button("👍 Accurate"):
-            append_vote(last["label"], last["target_iso"], last["verdict"], last["score"], "up")
+            append_vote(last["label"], last["target_local"], last["verdict"], last["score"], "up")
             refresh_stats()
-            st.success("✅ Feedback recorded — thank you!")
+            st.success("Logged 👍. Thank you for your feedback.")
 
         if col2.button("👎 Not accurate"):
-            append_vote(last["label"], last["target_iso"], last["verdict"], last["score"], "down")
+            append_vote(last["label"], last["target_local"], last["verdict"], last["score"], "down")
             refresh_stats()
-            st.success("✅ Feedback recorded — thank you!")
+            st.success("Logged 👎. Thank you for your feedback.")
 
         st.caption(
-            f"Last check: {last['label']} @ {last['target_iso']} → {last['verdict']} ({last['score']}/100)"
+            f"Last check: {last['label']} @ {last['target_local']} → {last['verdict']} ({last['score']}/100)"
         )
 
 except Exception:
-    st.warning(
-        "Feedback system isn't connected yet. "
-        "Make sure Streamlit Secrets contain gcp_service_account + sheet_id, "
-        "and your service account is shared as Editor on the sheet."
-    )
+    st.error("Feedback system isn't connected yet. Make sure Streamlit Secrets contain gcp_service_account + sheet_id, and your service account is shared as Editor on the sheet.")
 
-st.divider()
+
+# ----------------------------
+# Disclaimer
+# ----------------------------
 st.caption(
-    "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
-    "shade, drainage, or microclimate. Use at your own risk."
+    "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, shade, drainage, or microclimate. Use at your own risk."
 )
