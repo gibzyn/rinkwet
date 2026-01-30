@@ -246,6 +246,29 @@ def wet_assess(temp_f, dew_f, rh, wind_mph, precip_mm_hr):
 # ----------------------------
 st.title("🛼 RinkWet")
 st.caption("Forecast-based estimate for wet rink conditions (dew/condensation + rain + wind).")
+# ---------- Share this app ----------
+APP_URL = "https://rinkwet.streamlit.app"
+
+with st.expander("📣 Share this app"):
+    st.write("Send this link to teammates:")
+    st.code(https://rinkwet.streamlit.app/, language="")
+
+    st.markdown(
+        f"""
+        <button onclick="navigator.clipboard.writeText('{APP_URL}')"
+        style="padding:10px 14px;border-radius:10px;border:1px solid #555;background:#111;color:#fff;cursor:pointer;">
+        📋 Copy link
+        </button>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # QR code via public image endpoint (no extra packages needed)
+    qr_url = "https://api.qrserver.com/v1/create-qr-code/?" + urllib.parse.urlencode(
+        {"size": "220x220", "data": APP_URL}
+    )
+    st.image(qr_url, caption="Scan to open RinkWet")
+
 
 mode = st.radio("Check for", ["Now (arrival in X minutes)", "Pick a date & time"], horizontal=True)
 
@@ -442,6 +465,7 @@ except Exception as e:
     st.code(f"{type(e).__name__}: {e}")
     st.divider()
 st.caption("Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, shade, drainage, or microclimate. Use at your own risk.")
+
 
 
 
