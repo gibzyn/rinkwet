@@ -246,12 +246,6 @@ def wet_assess(temp_f, dew_f, rh, wind_mph, precip_mm_hr):
 # ----------------------------
 st.title("🛼 RinkWet")
 st.caption("Forecast-based estimate for wet rink conditions (dew/condensation + rain + wind).")
-# ---------- Share this app ----------
-APP_URL = "https://rinkwet.streamlit.app"
-
-with st.expander("📣 Share this app"):
-    st.write("Send this link to teammates:")
-    st.code(https://rinkwet.streamlit.app/, language="")
 
     st.markdown(
         f"""
@@ -465,6 +459,7 @@ except Exception as e:
     st.code(f"{type(e).__name__}: {e}")
     st.divider()
 st.caption("Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, shade, drainage, or microclimate. Use at your own risk.")
+
 
 
 
