@@ -1,0 +1,1 @@
+Thanks for taking interest into my project here, I play inline hockey and am trying to develop an app to track wether the rink is wet via a scaled set of paramiters prior to spending time to drive out and arrive at the rink just for it to be wet. Injury of mine equates resting time, so why not build an app to help the fellas
