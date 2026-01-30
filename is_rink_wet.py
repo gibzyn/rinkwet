@@ -419,12 +419,12 @@ try:
         if col1.button("👍 Accurate"):
             append_vote(last["label"], last["target_iso"], last["verdict"], last["score"], "up")
             refresh_stats()
-            st.success("Logged 👍 to Google Sheet")
+            st.success("✅ Feedback recorded — thank you!")
 
         if col2.button("👎 Not accurate"):
             append_vote(last["label"], last["target_iso"], last["verdict"], last["score"], "down")
             refresh_stats()
-            st.warning("Logged 👎 to Google Sheet")
+            st.warning("✅ Feedback recorded — thank you!")
 
         st.caption(
             f"Last check: {last['label']} @ {last['target_iso']} → {last['verdict']} ({last['score']}/100)"
@@ -440,4 +440,5 @@ except Exception as e:
     })
     st.write("**Exact error (safe):**")
     st.code(f"{type(e).__name__}: {e}")
+
 
