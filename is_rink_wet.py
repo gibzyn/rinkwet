@@ -274,7 +274,7 @@ def wet_assess(temp_f, dew_f, rh, wind_mph, precip_mm_hr):
 # ----------------------------
 # UI
 # ----------------------------
-st.title("🛼 RinkWet")
+st.title("🏒 RinkWet")
 st.caption("Forecast-based estimate for wet rink conditions (dew/condensation + rain + wind).")
 
 mode = st.radio("Check for", ["Now (arrival in X minutes)", "Pick a date & time"], horizontal=True)
@@ -512,4 +512,5 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, or microclimate. Use at your own risk."
 )
+
 
