@@ -47,8 +47,7 @@ _SESSION = requests.Session()
 # - include a descriptive User-Agent
 # - rate limit (don’t hammer)
 NOMINATIM_HEADERS = {
-    # Replace contact if you want, but keep it descriptive
-    "User-Agent": f"RinkWet/0.5.1 (+{APP_URL})"
+    "User-Agent": f"RinkWet/0.5.2 (+{APP_URL})"  # bumped for this fix
 }
 _NOMINATIM_MIN_INTERVAL_SEC = 1.0  # conservative: ~1 request/sec
 
@@ -403,6 +402,8 @@ def nominatim_search(query: str, limit: int = 6):
             "format": "json",
             "addressdetails": 1,
             "limit": limit,
+            # ✅ FIX: keep results in the US when users give a US query
+            "countrycodes": "us",
         },
         timeout=15,
         retries=1,
@@ -431,14 +432,16 @@ def _norm_admin_country_from_nominatim(addr: dict):
 
 def _build_nominatim_queries(original: str) -> list[str]:
     """
-    Nominatim is picky. Try a few variants before giving up.
-    Goal: make 'SB ... rink ...' style inputs resolve.
+    Nominatim is picky. Generate a few variants that improve hit-rate for:
+      - parks with "rink" in the user query
+      - "Outdoor Rink" style wording
+      - CA queries missing comma formatting
     """
     q = (original or "").strip()
     if not q:
         return []
 
-    out = []
+    out: list[str] = []
 
     # 1) Original
     out.append(q)
@@ -448,39 +451,52 @@ def _build_nominatim_queries(original: str) -> list[str]:
     if q2 and q2 != q:
         out.append(q2)
 
+    q2_lower = q2.lower()
+
     # 3) Expand common abbreviation: SB -> Santa Barbara
-    # Only if it looks like "SB ..." and doesn't already contain "Santa Barbara"
-    q_lower = q.lower()
-    if q_lower.startswith("sb ") and "santa barbara" not in q_lower:
-        out.append("Santa Barbara " + q[3:])
-        out.append("Santa Barbara, CA " + q[3:])
+    if q2_lower.startswith("sb ") and "santa barbara" not in q2_lower:
+        out.append("Santa Barbara " + q2[3:])
+        out.append("Santa Barbara, CA " + q2[3:])
 
-    # 4) Remove generic words that sometimes hurt matching
-    # (we keep "hockey" / city/state, but drop "rink" sometimes)
-    for drop in [" rink", " roller", " inline", " hockey"]:
-        qq = q2.lower()
-        if drop in qq:
-            # Remove the token but keep the rest
-            cleaned = " ".join([w for w in q2.split() if w.lower() != drop.strip()])
-            cleaned = " ".join(cleaned.split())
-            if cleaned and cleaned not in out:
-                out.append(cleaned)
+    # 4) Strip common "junk" tokens that often reduce POI matching
+    #    (keep location tokens like Calabasas/CA/Street names etc.)
+    junk = {
+        "outdoor", "rink", "roller", "inline", "hockey", "ice", "arena",
+        "court", "skate", "skating",
+    }
 
-    # 5) Add helpful hints if query is short / ambiguous
+    tokens = [t for t in q2.split() if t and t.lower() not in junk]
+    cleaned = " ".join(tokens).strip()
+    if cleaned and cleaned not in out:
+        out.append(cleaned)
+
+    # 5) If we end with " CA" but no comma, try comma form
+    #    "De Anza Park Calabasas CA" -> "De Anza Park Calabasas, CA"
+    if q2.endswith(" CA") and "," not in q2:
+        out.append(q2[:-3].strip() + ", CA")
+    if cleaned.endswith(" CA") and "," not in cleaned:
+        out.append(cleaned[:-3].strip() + ", CA")
+
+    # 6) If the query mentions "park", try park-only + city/state (if present)
+    #    (This helps cases where the rink itself isn't mapped, but the park is.)
+    if "park" in q2_lower:
+        park_tokens = [t for t in q2.split() if t.lower() not in junk]
+        park_clean = " ".join(park_tokens).strip()
+        if park_clean and park_clean not in out:
+            out.append(park_clean)
+
+    # 7) Small helpful hints if query is short / ambiguous
     if len(q2.split()) <= 6:
-        if "hockey" not in q_lower:
-            out.append(q2 + " hockey")
-        if "inline" not in q_lower:
-            out.append(q2 + " inline hockey")
-        if "roller" not in q_lower:
-            out.append(q2 + " roller hockey")
+        if "park" not in q2_lower:
+            out.append(q2 + " park")
 
     # De-dupe while preserving order
-    deduped = []
+    deduped: list[str] = []
     for s in out:
         s2 = " ".join((s or "").split())
         if s2 and s2 not in deduped:
             deduped.append(s2)
+
     return deduped[:6]
 
 
@@ -524,8 +540,6 @@ def geocode_with_fallback(query: str, count: int = 10):
     if r1:
         for r in r1:
             r["source"] = "open-meteo"
-            # open-meteo uses these keys:
-            # latitude, longitude, timezone, name, admin1, country
         return r1
 
     # 2) Open-Meteo simplified
@@ -844,7 +858,7 @@ def qp_set(**kwargs):
 # UI
 # ----------------------------
 st.title("🏒 RinkWet")
-APP_VERSION = "v0.5.1"
+APP_VERSION = "v0.5.2"
 
 left, right = st.columns([4, 1])
 with left:
@@ -967,7 +981,6 @@ if use_custom:
             lat = r.get("latitude", 0.0)
             lon = r.get("longitude", 0.0)
 
-            # Prefer Nominatim's richer display_name, otherwise fallback to basic.
             display_name = (r.get("display_name") or "").strip()
             if display_name:
                 label_line = display_name
@@ -1005,14 +1018,12 @@ if use_custom:
         col_save, col_share = st.columns(2)
         if col_save.button("⭐ Save to My rinks", key="geo_save_btn"):
             try:
-                # Save a clean-ish label. Prefer display_name if available.
                 display_name = (chosen_geo.get("display_name") or "").strip()
                 if display_name:
                     label = display_name
                 else:
                     label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
 
-                # Trim super-long labels (Streamlit UI + sheet friendliness)
                 label = " ".join(label.split())
                 if len(label) > 80:
                     label = label[:77] + "..."
