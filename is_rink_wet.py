@@ -31,6 +31,9 @@ DEFAULT_TZ = "America/Los_Angeles"  # fallback only
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 
+# Free POI/name search fallback (OpenStreetMap)
+NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
+
 MAX_FORECAST_DAYS = 16
 APP_URL = "https://rinkwet.streamlit.app/"
 
@@ -40,13 +43,45 @@ APP_URL = "https://rinkwet.streamlit.app/"
 # ----------------------------
 _SESSION = requests.Session()
 
+# Nominatim usage expectations:
+# - include a descriptive User-Agent
+# - rate limit (don’t hammer)
+NOMINATIM_HEADERS = {
+    # Replace contact if you want, but keep it descriptive
+    "User-Agent": f"RinkWet/0.5.0 (+{APP_URL})"
+}
+_NOMINATIM_MIN_INTERVAL_SEC = 1.0  # conservative: ~1 request/sec
 
-def request_json(url: str, params: dict, timeout: int = 15, retries: int = 2, backoff: float = 0.6):
+
+def _throttle_nominatim():
+    """
+    Basic local throttle. Streamlit reruns can still cause multiple calls,
+    so we keep the throttle timestamp in session_state.
+    """
+    last = st.session_state.get("_nominatim_last_ts", 0.0)
+    now = time.time()
+    wait = _NOMINATIM_MIN_INTERVAL_SEC - (now - last)
+    if wait > 0:
+        time.sleep(wait)
+    st.session_state["_nominatim_last_ts"] = time.time()
+
+
+def request_json(
+    url: str,
+    params: dict,
+    timeout: int = 15,
+    retries: int = 2,
+    backoff: float = 0.6,
+    headers: dict | None = None,
+    throttle: bool = False,
+):
     """Lightweight retry wrapper for transient network/API hiccups."""
     last_exc = None
     for attempt in range(retries + 1):
         try:
-            r = _SESSION.get(url, params=params, timeout=timeout)
+            if throttle:
+                _throttle_nominatim()
+            r = _SESSION.get(url, params=params, timeout=timeout, headers=headers)
             r.raise_for_status()
             return r.json()
         except requests.RequestException as e:
@@ -329,21 +364,20 @@ def parse_latlon(text: str):
 
 
 def simplify_query(q: str):
+    """
+    Light cleanup so Open-Meteo has a better chance, but don't over-strip.
+    """
     if not q:
         return q
-    bad_words = [
-        "inline", "hockey", "arena", "rink", "park", "sports", "center", "centre",
-        "ice", "roller", "facility"
-    ]
     s = q.strip()
-    for ch in ["-", "|", "/", "\\", "#", "@", "—"]:
+    for ch in ["|", "\\", "#", "@"]:
         s = s.replace(ch, " ")
-    tokens = [t for t in s.split() if t.lower() not in bad_words]
-    s2 = " ".join(tokens).strip()
-    return s2 if s2 else q.strip()
+    # keep commas because "City, State" helps
+    s = " ".join(s.split())
+    return s
 
 
-def geocode(query: str, count: int = 10):
+def geocode_open_meteo(query: str, count: int = 10):
     return request_json(
         OPEN_METEO_GEOCODE,
         params={"name": query, "count": count, "language": "en", "format": "json"},
@@ -352,17 +386,105 @@ def geocode(query: str, count: int = 10):
     ).get("results") or []
 
 
-def geocode_with_fallback(query: str, count: int = 10):
+@st.cache_data(ttl=3600)
+def nominatim_search(query: str, limit: int = 6):
+    """
+    Free POI/name search fallback for rink/business-like queries.
+    TTL cached to reduce calls and avoid rate limiting.
+    """
     q = (query or "").strip()
     if not q:
         return []
-    r1 = geocode(q, count=count)
+
+    data = request_json(
+        NOMINATIM_SEARCH,
+        params={
+            "q": q,
+            "format": "json",
+            "addressdetails": 1,
+            "limit": limit,
+        },
+        timeout=15,
+        retries=1,
+        headers=NOMINATIM_HEADERS,
+        throttle=True,
+    )
+    return data if isinstance(data, list) else []
+
+
+def _norm_admin_country_from_nominatim(addr: dict):
+    """
+    Extract something useful for display + saved label.
+    """
+    if not isinstance(addr, dict):
+        return "", ""
+    admin = (
+        addr.get("state")
+        or addr.get("province")
+        or addr.get("region")
+        or addr.get("county")
+        or ""
+    )
+    country = addr.get("country") or ""
+    return admin, country
+
+
+def geocode_with_fallback(query: str, count: int = 10):
+    """
+    Strategy:
+      1) Open-Meteo (great for cities/regions)
+      2) Open-Meteo with simplified query
+      3) Nominatim (great for POI/business names)
+    Returns a unified list of result dicts.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    # 1) Open-Meteo
+    r1 = geocode_open_meteo(q, count=count)
     if r1:
+        for r in r1:
+            r["source"] = "open-meteo"
         return r1
+
+    # 2) Open-Meteo simplified
     q2 = simplify_query(q)
     if q2 != q:
-        return geocode(q2, count=count)
-    return []
+        r2 = geocode_open_meteo(q2, count=count)
+        if r2:
+            for r in r2:
+                r["source"] = "open-meteo"
+            return r2
+
+    # 3) Nominatim fallback
+    nom = nominatim_search(q, limit=min(6, count))
+    out = []
+    for r in nom:
+        try:
+            lat = float(r.get("lat"))
+            lon = float(r.get("lon"))
+            display = (r.get("display_name") or "").strip()
+            addr = r.get("address") or {}
+            admin1, country = _norm_admin_country_from_nominatim(addr)
+
+            # Use first chunk for short name
+            short = display.split(",")[0].strip() if display else "Unknown place"
+            out.append(
+                {
+                    "name": short,
+                    "admin1": admin1,
+                    "country": country,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "display_name": display,
+                    "source": "nominatim",
+                }
+            )
+        except Exception:
+            continue
+
+    return out
 
 
 # ----------------------------
@@ -381,7 +503,7 @@ def fetch_weather(lat: float, lon: float, forecast_days: int):
     params = {
         "latitude": lat,
         "longitude": lon,
-        "timezone": "auto",  # <-- key change: no fixed LA time
+        "timezone": "auto",
         "forecast_days": forecast_days,
         "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,is_day",
         "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m,is_day",
@@ -566,10 +688,14 @@ def wet_assess(
         if matched_time_delta_minutes <= 15:
             reasons["Data quality"].append(f"Forecast time match: within {matched_time_delta_minutes} min.")
         elif matched_time_delta_minutes <= 30:
-            reasons["Data quality"].append(f"Forecast time match: within {matched_time_delta_minutes} min (some uncertainty).")
+            reasons["Data quality"].append(
+                f"Forecast time match: within {matched_time_delta_minutes} min (some uncertainty)."
+            )
             score += 2
         else:
-            reasons["Data quality"].append(f"Forecast time match: within {matched_time_delta_minutes} min (higher uncertainty).")
+            reasons["Data quality"].append(
+                f"Forecast time match: within {matched_time_delta_minutes} min (higher uncertainty)."
+            )
             score += 4
     else:
         reasons["Data quality"].append("Forecast time match unknown.")
@@ -592,7 +718,10 @@ def action_recommendation(verdict: str, surface_type: str):
 
     v = (verdict or "").lower()
     if "yes" in v:
-        return f"Action: Expect slick spots. Consider softer wheels and cautious corners (surface: {surface_hint}). If you can, check again in 30–60 min."
+        return (
+            f"Action: Expect slick spots. Consider softer wheels and cautious corners (surface: {surface_hint}). "
+            "If you can, check again in 30–60 min."
+        )
     if "maybe" in v:
         return f"Action: Borderline. Plan for damp patches—do a quick surface check on arrival (surface: {surface_hint})."
     return f"Action: Likely normal conditions. Bring your usual setup (surface: {surface_hint})."
@@ -622,7 +751,7 @@ def qp_set(**kwargs):
 # UI
 # ----------------------------
 st.title("🏒 RinkWet")
-APP_VERSION = "v0.5.0"
+APP_VERSION = "v0.5.1"
 
 left, right = st.columns([4, 1])
 with left:
@@ -685,9 +814,10 @@ use_custom = st.toggle("Search a different location", value=False)
 place = ""
 
 if use_custom:
+    st.caption("Tip: best results are **Place name + City, State** (example: `SB Roller Hockey Rink, Santa Barbara, CA`).")
     place = st.text_input(
-        "Search location (City/State, or paste coords like `34.21, -119.08`)",
-        placeholder="e.g., 'Ventura, CA' or '34.2138, -119.0856'",
+        "Search location (City/State, rink name, or paste coords like `34.21, -119.08`)",
+        placeholder="e.g., 'SB Roller Hockey Rink, Santa Barbara, CA' or '34.2138, -119.0856'",
         key="geo_query",
     )
 
@@ -707,6 +837,8 @@ if use_custom:
                     "country": "",
                     "latitude": lat,
                     "longitude": lon,
+                    "display_name": "Custom coordinates",
+                    "source": "coords",
                 }]
                 st.session_state.geo_selected_idx = 0
                 st.session_state.geo_selected = st.session_state.geocode_results[0]
@@ -718,8 +850,9 @@ if use_custom:
                     results = st.session_state.geocode_results or []
                     if not results:
                         st.warning(
-                            "No results from the geocoder.\n\n"
-                            "Try **City, State** (example: `Ventura, CA`) or paste **coordinates** like `34.2138, -119.0856`."
+                            "No results.\n\n"
+                            "Try **Place + City, State** (example: `SB Roller Hockey Rink, Santa Barbara, CA`) "
+                            "or paste **coordinates** like `34.2138, -119.0856`."
                         )
                         st.session_state.geo_selected = None
                     else:
@@ -735,12 +868,22 @@ if use_custom:
     if results:
         options = []
         for r in results:
-            name = r.get("name", "")
-            admin1 = r.get("admin1", "")
-            country = r.get("country", "")
             lat = r.get("latitude", 0.0)
             lon = r.get("longitude", 0.0)
-            options.append(f"{name}, {admin1}, {country}  ({lat:.4f}, {lon:.4f})")
+
+            # Prefer Nominatim's richer display_name, otherwise fallback to basic.
+            display_name = (r.get("display_name") or "").strip()
+            if display_name:
+                label_line = display_name
+            else:
+                name = (r.get("name", "") or "").strip()
+                admin1 = (r.get("admin1", "") or "").strip()
+                country = (r.get("country", "") or "").strip()
+                label_line = ", ".join([x for x in [name, admin1, country] if x])
+
+            source = r.get("source", "")
+            suffix = f"[{source}]" if source else ""
+            options.append(f"{label_line}  ({lat:.4f}, {lon:.4f}) {suffix}")
 
         st.session_state.geo_selected_idx = st.selectbox(
             "Choose result",
@@ -756,9 +899,21 @@ if use_custom:
         col_save, col_share = st.columns(2)
         if col_save.button("⭐ Save to My rinks", key="geo_save_btn"):
             try:
-                label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
+                # Save a clean-ish label. Prefer display_name if available.
+                display_name = (chosen_geo.get("display_name") or "").strip()
+                if display_name:
+                    label = display_name
+                else:
+                    label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
+
+                # Trim super-long labels (Streamlit UI + sheet friendliness)
+                label = " ".join(label.split())
+                if len(label) > 80:
+                    label = label[:77] + "..."
+
                 lat = float(chosen_geo["latitude"])
                 lon = float(chosen_geo["longitude"])
+
                 if label and all(f["label"] != label for f in st.session_state.favorites):
                     st.session_state.favorites.append({"label": label, "lat": lat, "lon": lon})
                     st.success("Saved to My rinks (session only).")
@@ -770,7 +925,15 @@ if use_custom:
 
         if col_share.button("🔗 Make shareable link", key="geo_share_btn"):
             try:
-                label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
+                display_name = (chosen_geo.get("display_name") or "").strip()
+                if display_name:
+                    label = display_name
+                else:
+                    label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
+                label = " ".join(label.split())
+                if len(label) > 80:
+                    label = label[:77] + "..."
+
                 lat = float(chosen_geo["latitude"])
                 lon = float(chosen_geo["longitude"])
                 qp_set(lat=f"{lat:.5f}", lon=f"{lon:.5f}", label=label)
@@ -787,10 +950,22 @@ def resolve_location():
         g = st.session_state.geo_selected
         lat = float(g["latitude"])
         lon = float(g["longitude"])
-        label = f'{g.get("name","")} {g.get("admin1","")} {g.get("country","")}'.strip()
+
+        display_name = (g.get("display_name") or "").strip()
+        if display_name:
+            label = display_name
+        else:
+            label = f'{g.get("name","")} {g.get("admin1","")} {g.get("country","")}'.strip()
+
+        label = " ".join(label.split())
+        if len(label) > 80:
+            label = label[:77] + "..."
+
         return label, lat, lon
+
     if selected_fav:
         return selected_fav["label"], float(selected_fav["lat"]), float(selected_fav["lon"])
+
     return DEFAULT_LABEL, DEFAULT_LAT, DEFAULT_LON
 
 
