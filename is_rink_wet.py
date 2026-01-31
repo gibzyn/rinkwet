@@ -36,6 +36,7 @@ OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 
 MAX_FORECAST_DAYS = 16
+APP_URL = "https://rinkwet.streamlit.app/"
 
 
 # ----------------------------
@@ -276,17 +277,6 @@ def wet_assess(temp_f, dew_f, rh, wind_mph, precip_mm_hr):
 st.title("🛼 RinkWet")
 st.caption("Forecast-based estimate for wet rink conditions (dew/condensation + rain + wind).")
 
-with st.expander("📣 Share this app"):
-    # This avoids syntax errors and doesn’t rely on unknown APP_URL.
-    st.write("Copy your site URL from the browser address bar and share it.")
-    st.code("https://rinkwet.streamlit.app/", language="text")
-
-    qr_url = "https://api.qrserver.com/v1/create-qr-code/?" + urllib.parse.urlencode(
-        {"size": "220x220", "data": "https://rinkwet.streamlit.app/"}
-    )
-    st.image(qr_url, caption="Scan to open RinkWet")
-
-
 mode = st.radio("Check for", ["Now (arrival in X minutes)", "Pick a date & time"], horizontal=True)
 
 use_default = st.toggle("Use Freedom Park default", value=True)
@@ -310,6 +300,10 @@ st.caption(f"Target time (America/Los_Angeles): {target_dt.strftime('%Y-%m-%d %H
 
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
+
+if "debug_safe" not in st.session_state:
+    st.session_state.debug_safe = None
+
 
 if st.button("Check"):
     try:
@@ -387,6 +381,18 @@ if st.button("Check"):
             "score": score_t,
         }
 
+        # Save safe debug info for bottom Debug expander
+        st.session_state.debug_safe = {
+            "now_local": datetime.now(RINK_TZ).strftime("%Y-%m-%d %H:%M %Z"),
+            "target_dt": target_dt.strftime("%Y-%m-%d %H:%M %Z"),
+            "i_now": i_now,
+            "i_t": i_t,
+            "used_hour": used_hour,
+            "label": label,
+            "lat": round(float(lat), 5),
+            "lon": round(float(lon), 5),
+        }
+
         # Display
         st.subheader(f"📍 {label}")
 
@@ -432,13 +438,6 @@ if st.button("Check"):
         if used_hour:
             st.caption(f"Target forecast hour used (America/Los_Angeles): {used_hour}")
 
-        # Optional: quick sanity debug (safe)
-        with st.expander("Debug (safe)"):
-            st.write("now_local:", datetime.now(RINK_TZ).strftime("%Y-%m-%d %H:%M %Z"))
-            st.write("target_dt:", target_dt.strftime("%Y-%m-%d %H:%M %Z"))
-            st.write("i_now:", i_now, "i_t:", i_t)
-            st.write("used_hour:", used_hour)
-
     except requests.RequestException as e:
         st.error(f"Network/API error: {e}")
     except Exception as e:
@@ -478,12 +477,38 @@ try:
         )
 
 except Exception:
-    st.error("Feedback system isn't connected yet. Make sure Streamlit Secrets contain gcp_service_account + sheet_id, and your service account is shared as Editor on the sheet.")
+    st.error(
+        "Feedback system isn't connected yet. Make sure Streamlit Secrets contain gcp_service_account + sheet_id, "
+        "and your service account is shared as Editor on the sheet."
+    )
+
+
+# ----------------------------
+# Share + Debug (bottom)
+# ----------------------------
+st.divider()
+
+with st.expander("📣 Share this app"):
+    st.write("Share this link:")
+    st.code(APP_URL, language="text")
+
+    qr_url = "https://api.qrserver.com/v1/create-qr-code/?" + urllib.parse.urlencode(
+        {"size": "220x220", "data": APP_URL}
+    )
+    st.image(qr_url, caption="Scan to open RinkWet")
+
+with st.expander("Debug (safe)"):
+    dbg = st.session_state.get("debug_safe")
+    if not dbg:
+        st.write("Run a check first.")
+    else:
+        st.json(dbg)
 
 
 # ----------------------------
 # Disclaimer
 # ----------------------------
 st.caption(
-    "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, shade, drainage, or microclimate. Use at your own risk."
+    "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
+    "shade, drainage, or microclimate. Use at your own risk."
 )
