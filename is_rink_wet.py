@@ -624,6 +624,18 @@ def parse_float(x):
 # UI
 # ----------------------------
 st.title("🏒 RinkWet")
+APP_VERSION = "v0.4.0"
+
+left, right = st.columns([4, 1])
+with left:
+    st.info(
+        "🚧 **UNDER DEVELOPMENT** — RinkWet is in active development. "
+        "Some features may be incomplete or temporarily unavailable.",
+        icon="🚧",
+    )
+with right:
+    st.caption(f"**Version:** {APP_VERSION}")
+
 st.caption("Weather-based estimate for wet rink conditions (dew/condensation + recent rain + wind).")
 
 # Session state init
@@ -1182,3 +1194,4 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, surface material, or microclimate. Use at your own risk."
 )
+
