@@ -654,6 +654,13 @@ if "pending_observed" not in st.session_state:
 if "geocode_results" not in st.session_state:
     st.session_state.geocode_results = []
 
+# >>> FIX: persist geocode selection across reruns
+if "geo_selected_idx" not in st.session_state:
+    st.session_state.geo_selected_idx = 0
+if "geo_selected" not in st.session_state:
+    st.session_state.geo_selected = None
+# <<<
+
 # Surface type toggle
 surface_type = st.selectbox(
     "Surface type",
@@ -684,18 +691,38 @@ if shared_lat is not None and shared_lon is not None and shared_label:
 selected_fav_label = st.selectbox("My rinks", fav_labels, index=fav_default_idx)
 selected_fav = next((f for f in st.session_state.favorites if f["label"] == selected_fav_label), None)
 
+# >>> FIX: robust "Search a different location" block (keys + persisted selection + error visibility)
 use_custom = st.toggle("Search a different location", value=False)
 place = ""
-chosen_geo = None
 
 if use_custom:
-    place = st.text_input("Search location", placeholder="e.g., 'Ventura, CA' or 'Freedom Park Camarillo'")
+    place = st.text_input(
+        "Search location",
+        placeholder="e.g., 'Ventura, CA' or 'Freedom Park Camarillo'",
+        key="geo_query",
+    )
+
     colg1, colg2 = st.columns([1, 1])
-    if colg1.button("Search"):
+    if colg1.button("Search", key="geo_search_btn"):
         if not place.strip():
             st.warning("Type a location first.")
         else:
-            st.session_state.geocode_results = geocode(place.strip())
+            try:
+                with st.spinner("Searching locations..."):
+                    st.session_state.geocode_results = geocode(place.strip())
+
+                results = st.session_state.geocode_results or []
+                if not results:
+                    st.warning("No results. Try 'City, State' or a more specific name.")
+                    st.session_state.geo_selected = None
+                else:
+                    st.session_state.geo_selected_idx = 0
+                    st.session_state.geo_selected = results[0]
+            except Exception as e:
+                st.error("Geocoding failed. Exact error:")
+                st.code(str(e))
+                st.session_state.geocode_results = []
+                st.session_state.geo_selected = None
 
     results = st.session_state.geocode_results or []
     if results:
@@ -704,15 +731,23 @@ if use_custom:
             name = r.get("name", "")
             admin1 = r.get("admin1", "")
             country = r.get("country", "")
-            lat = r.get("latitude", "")
-            lon = r.get("longitude", "")
+            lat = r.get("latitude", 0.0)
+            lon = r.get("longitude", 0.0)
             options.append(f"{name}, {admin1}, {country}  ({lat:.4f}, {lon:.4f})")
 
-        idx = st.selectbox("Choose result", list(range(len(options))), format_func=lambda i: options[i])
-        chosen_geo = results[idx]
+        st.session_state.geo_selected_idx = st.selectbox(
+            "Choose result",
+            list(range(len(options))),
+            index=min(st.session_state.geo_selected_idx, len(options) - 1),
+            format_func=lambda i: options[i],
+            key="geo_select_idx",
+        )
+
+        st.session_state.geo_selected = results[st.session_state.geo_selected_idx]
+        chosen_geo = st.session_state.geo_selected
 
         col_save, col_share = st.columns(2)
-        if col_save.button("⭐ Save to My rinks"):
+        if col_save.button("⭐ Save to My rinks", key="geo_save_btn"):
             try:
                 label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
                 lat = float(chosen_geo["latitude"])
@@ -722,18 +757,26 @@ if use_custom:
                     st.success("Saved to My rinks (session only).")
                 else:
                     st.info("Already in My rinks.")
-            except Exception:
-                st.error("Couldn’t save this location.")
+            except Exception as e:
+                st.error("Couldn’t save this location. Exact error:")
+                st.code(str(e))
 
-        if col_share.button("🔗 Make shareable link"):
+        if col_share.button("🔗 Make shareable link", key="geo_share_btn"):
             try:
                 label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
                 lat = float(chosen_geo["latitude"])
                 lon = float(chosen_geo["longitude"])
                 qp_set(lat=f"{lat:.5f}", lon=f"{lon:.5f}", label=label)
                 st.success("Link updated. Copy the URL from your browser bar to share.")
-            except Exception:
-                st.error("Couldn’t set link parameters.")
+            except Exception as e:
+                st.error("Couldn’t set link parameters. Exact error:")
+                st.code(str(e))
+    else:
+        # If user toggles on but hasn't searched yet, keep selection empty
+        st.session_state.geo_selected = None
+else:
+    st.session_state.geo_selected = None
+# <<<
 
 
 # Time inputs
@@ -754,11 +797,14 @@ st.caption(f"Target time (America/Los_Angeles): {target_dt.strftime('%Y-%m-%d %H
 
 # Determine which location we’re using
 def resolve_location():
-    if use_custom and chosen_geo:
+    # >>> FIX: use persisted selection instead of local var (survives reruns)
+    if use_custom and st.session_state.get("geo_selected"):
+        chosen_geo = st.session_state.geo_selected
         lat = float(chosen_geo["latitude"])
         lon = float(chosen_geo["longitude"])
         label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
         return label, lat, lon
+    # <<<
     if selected_fav:
         return selected_fav["label"], float(selected_fav["lat"]), float(selected_fav["lon"])
     return DEFAULT_LABEL, DEFAULT_LAT, DEFAULT_LON
@@ -978,17 +1024,31 @@ if st.button("Check"):
 
             st.divider()
             st.write("Add a note (helps everyone):")
-            nt = st.selectbox("Note type", ["Irrigation", "Shade", "Drainage", "Sticky spot", "Other"], index=0)
-            ntext = st.text_input("Note", placeholder="e.g., 'Back corner stays wet after rain' (keep it short)")
-            if st.button("Submit note"):
+
+            # >>> FIX: stable keys + show exact error + clear input on success
+            nt = st.selectbox(
+                "Note type",
+                ["Irrigation", "Shade", "Drainage", "Sticky spot", "Other"],
+                index=0,
+                key=f"note_type::{label}",
+            )
+            ntext = st.text_input(
+                "Note",
+                placeholder="e.g., 'Back corner stays wet after rain' (keep it short)",
+                key=f"note_text::{label}",
+            )
+            if st.button("Submit note", key=f"submit_note::{label}"):
                 if not ntext.strip():
                     st.warning("Type a note first.")
                 else:
                     try:
                         append_note(label, nt, ntext.strip())
                         st.success("Note added. Thanks.")
-                    except Exception:
-                        st.error("Couldn’t write note (check your Sheets permissions).")
+                        st.session_state[f"note_text::{label}"] = ""  # clear text box
+                    except Exception as e:
+                        st.error("Couldn’t write note. Exact error:")
+                        st.code(str(e))
+            # <<<
 
         st.write("**Now (15-minute snapshot)**")
         cols = st.columns(5)
@@ -1194,4 +1254,3 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, surface material, or microclimate. Use at your own risk."
 )
-
