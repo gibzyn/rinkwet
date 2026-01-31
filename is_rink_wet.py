@@ -15,12 +15,6 @@ from google.oauth2.service_account import Credentials
 
 
 # ----------------------------
-# Timezone (force rink local time)
-# ----------------------------
-RINK_TZ = ZoneInfo("America/Los_Angeles")  # PST/PDT automatically
-
-
-# ----------------------------
 # Streamlit setup
 # ----------------------------
 st.set_page_config(page_title="RinkWet", page_icon="🏒", layout="centered")
@@ -32,6 +26,7 @@ st.set_page_config(page_title="RinkWet", page_icon="🏒", layout="centered")
 DEFAULT_LABEL = "Freedom Park Inline Hockey Arena (Camarillo)"
 DEFAULT_LAT = 34.2138
 DEFAULT_LON = -119.0856
+DEFAULT_TZ = "America/Los_Angeles"  # fallback only
 
 OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
@@ -67,7 +62,6 @@ def request_json(url: str, params: dict, timeout: int = 15, retries: int = 2, ba
 # ----------------------------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    # Keep Drive scope if your environment needs it for open_by_key / metadata.
     "https://www.googleapis.com/auth/drive",
 ]
 
@@ -108,7 +102,6 @@ def get_worksheet_notes():
     try:
         return sh.worksheet("notes")
     except Exception:
-        # Create a notes sheet if it doesn't exist
         ws = sh.add_worksheet(title="notes", rows=1000, cols=10)
         ws.append_row(["ts_utc", "label", "note_type", "note_text"], value_input_option="RAW")
         return ws
@@ -135,24 +128,17 @@ def ensure_feedback_header():
 
 
 def append_feedback_row(row_dict: dict):
-    """
-    Append a feedback row using existing sheet header as the source of truth.
-    If header includes fields we don't have, fill empty.
-    If row_dict includes extra fields, append them as extra columns (rare).
-    """
     ws = get_worksheet_feedback()
     header = ensure_feedback_header()
     ts_utc = datetime.utcnow().isoformat(timespec="seconds")
     row_dict = {"ts_utc": ts_utc, **row_dict}
 
-    # If header is empty for some reason, fall back to writing keys
     if not header:
         header = list(row_dict.keys())
         ws.append_row(header, value_input_option="RAW")
 
     row = [row_dict.get(col, "") for col in header]
 
-    # If there are extra keys not in header, append them as new columns on the right
     extra_keys = [k for k in row_dict.keys() if k not in header]
     if extra_keys:
         row.extend([row_dict[k] for k in extra_keys])
@@ -190,8 +176,6 @@ def read_feedback_stats():
     up = down = total = 0
     observed_total = 0
 
-    # Confusion matrix: predicted (rows) vs observed (cols)
-    # Classes: dry, damp, wet
     classes = ["dry", "damp", "wet"]
     cm = {p: {o: 0 for o in classes} for p in classes}
 
@@ -259,10 +243,6 @@ def refresh_feedback_stats():
 
 @st.cache_data(ttl=30)
 def read_recent_notes(label: str, limit: int = 5):
-    """
-    Read last N notes for the given rink label (most recent first).
-    Uses in-memory filtering since sheet is likely small. TTL caches.
-    """
     ws = get_worksheet_notes()
     values = ws.get_all_values()
     if not values or len(values) < 2:
@@ -297,7 +277,6 @@ def read_recent_notes(label: str, limit: int = 5):
             }
         )
 
-    # newest first
     rows.reverse()
     return rows[:limit]
 
@@ -314,31 +293,95 @@ def append_note(label: str, note_type: str, note_text: str):
 
 
 # ----------------------------
-# Weather + scoring helpers
+# Location helpers (lat/lon + geocode fallback)
 # ----------------------------
-def geocode(query: str):
+def parse_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def parse_latlon(text: str):
+    """
+    Accepts:
+      '34.2138, -119.0856' OR '34.2138 -119.0856'
+    Returns (lat, lon) or None
+    """
+    if not text:
+        return None
+    t = text.strip().replace("(", "").replace(")", "")
+    if "," in t:
+        parts = [p.strip() for p in t.split(",") if p.strip()]
+    else:
+        parts = [p.strip() for p in t.split() if p.strip()]
+
+    if len(parts) != 2:
+        return None
+
+    lat = parse_float(parts[0])
+    lon = parse_float(parts[1])
+    if lat is None or lon is None:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return (lat, lon)
+
+
+def simplify_query(q: str):
+    if not q:
+        return q
+    bad_words = [
+        "inline", "hockey", "arena", "rink", "park", "sports", "center", "centre",
+        "ice", "roller", "facility"
+    ]
+    s = q.strip()
+    for ch in ["-", "|", "/", "\\", "#", "@", "—"]:
+        s = s.replace(ch, " ")
+    tokens = [t for t in s.split() if t.lower() not in bad_words]
+    s2 = " ".join(tokens).strip()
+    return s2 if s2 else q.strip()
+
+
+def geocode(query: str, count: int = 10):
     return request_json(
         OPEN_METEO_GEOCODE,
-        params={"name": query, "count": 5, "language": "en", "format": "json"},
+        params={"name": query, "count": count, "language": "en", "format": "json"},
         timeout=15,
         retries=2,
     ).get("results") or []
 
 
+def geocode_with_fallback(query: str, count: int = 10):
+    q = (query or "").strip()
+    if not q:
+        return []
+    r1 = geocode(q, count=count)
+    if r1:
+        return r1
+    q2 = simplify_query(q)
+    if q2 != q:
+        return geocode(q2, count=count)
+    return []
+
+
+# ----------------------------
+# Weather + scoring helpers
+# ----------------------------
 def fetch_weather(lat: float, lon: float, forecast_days: int):
     """
-    Force Open-Meteo to return times in America/Los_Angeles.
-
-    Notes on precipitation:
-      - hourly.precipitation is the *preceding hour sum* (mm), not a rate.
-      - minutely_15.precipitation is the *preceding 15 minutes sum* (mm).
+    IMPORTANT:
+      - timezone="auto" makes Open-Meteo return times in the *location's* timezone
+        (Florida -> Eastern, etc.)
+      - hourly.precipitation is the preceding hour sum (mm)
+      - minutely_15.precipitation is the preceding 15 min sum (mm)
     """
     forecast_days = max(1, min(MAX_FORECAST_DAYS, int(forecast_days)))
 
     params = {
         "latitude": lat,
         "longitude": lon,
-        "timezone": "America/Los_Angeles",
+        "timezone": "auto",  # <-- key change: no fixed LA time
         "forecast_days": forecast_days,
         "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,is_day",
         "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m,is_day",
@@ -352,7 +395,6 @@ def c_to_f(c):
 
 
 def compute_dewpoint_c(temp_c: float, rh: float):
-    # Magnus approximation
     a, b = 17.62, 243.12
     gamma = (a * temp_c / (b + temp_c)) + math.log(rh / 100.0)
     return (b * gamma) / (a - gamma)
@@ -363,12 +405,12 @@ def at(block: dict, key: str, idx: int):
     return arr[idx] if 0 <= idx < len(arr) else None
 
 
-def parse_times_local(times: list[str]):
-    """Interpret Open-Meteo timezone-local strings as rink-local aware datetimes."""
+def parse_times_local(times: list[str], tz: ZoneInfo):
+    """Interpret Open-Meteo timezone-local strings as timezone-aware datetimes."""
     out = []
     for t in times or []:
         dt_naive = datetime.fromisoformat(t)
-        out.append(dt_naive.replace(tzinfo=RINK_TZ))
+        out.append(dt_naive.replace(tzinfo=tz))
     return out
 
 
@@ -381,14 +423,12 @@ def pick_index(times_local: list[datetime], target_dt_local: datetime) -> int:
     )
 
 
-def needed_forecast_days_for(target_dt_local: datetime) -> int:
-    today_local = datetime.now(RINK_TZ).date()
-    delta_days = (target_dt_local.date() - today_local).days
+def needed_forecast_days_for(target_dt_local: datetime, now_local: datetime) -> int:
+    delta_days = (target_dt_local.date() - now_local.date()).days
     return max(1, min(MAX_FORECAST_DAYS, delta_days + 2))
 
 
 def sum_recent(arr: list, end_idx: int, lookback: int):
-    """Sum numeric arr over a window ending at end_idx."""
     if not arr:
         return 0.0
     s = 0.0
@@ -407,33 +447,16 @@ def sum_recent(arr: list, end_idx: int, lookback: int):
 
 
 def surface_adjustments(surface_type: str):
-    """
-    Simple tuning knobs (feel-based, not "scientific"):
-      - Tile often stays slick when damp and can "feel wet" longer
-      - Concrete dries a bit more predictably
-      - Sport court sits between
-    Returns: dict with additive adjustments to components.
-    """
     s = (surface_type or "").strip().lower()
     if s.startswith("tile"):
-        return {
-            "dew_bonus": 6,       # dew/condensation feels worse
-            "wind_dry_bonus": -2, # wind drying slightly less effective
-            "rain_bonus": 5,      # rain wetness lingers
-        }
+        return {"dew_bonus": 6, "wind_dry_bonus": -2, "rain_bonus": 5}
     if s.startswith("sport"):
         return {"dew_bonus": 3, "wind_dry_bonus": -1, "rain_bonus": 2}
-    # concrete default
     return {"dew_bonus": 0, "wind_dry_bonus": 0, "rain_bonus": 0}
 
 
 def compute_confidence(match_delta_min: int | None, dewpoint_source: str, precip_present: bool):
-    """
-    Confidence is about data quality / alignment, not wetness probability.
-    """
     score = 0
-
-    # Time alignment
     if match_delta_min is None:
         score -= 1
     elif match_delta_min <= 15:
@@ -443,18 +466,10 @@ def compute_confidence(match_delta_min: int | None, dewpoint_source: str, precip
     else:
         score -= 1
 
-    # Dew point source
-    # "api" is better than computed from temp/RH
     if dewpoint_source == "api":
         score += 2
-    elif dewpoint_source == "computed":
-        score += 0
 
-    # Precip data presence
-    if precip_present:
-        score += 1
-    else:
-        score -= 1
+    score += 1 if precip_present else -1
 
     if score >= 4:
         return "High"
@@ -474,9 +489,6 @@ def wet_assess(
     matched_time_delta_minutes: int | None,
     surface_type: str,
 ):
-    """
-    Returns: verdict, score(0-100), grouped_reasons_dict
-    """
     adj = surface_adjustments(surface_type)
     score = 0
 
@@ -487,7 +499,6 @@ def wet_assess(
         "Data quality": [],
     }
 
-    # Recent precipitation
     if precip_recent_mm is not None:
         if precip_recent_mm >= 1.0:
             score += 60 + adj["rain_bonus"]
@@ -506,7 +517,6 @@ def wet_assess(
     else:
         reasons["Rain / recent moisture"].append("Missing precipitation data.")
 
-    # Dew/condensation risk
     if temp_f is not None and dew_f is not None:
         spread = temp_f - dew_f
         if spread <= 2:
@@ -523,7 +533,6 @@ def wet_assess(
     else:
         reasons["Condensation / dew"].append("Missing temperature or dew point.")
 
-    # Humidity supports dew risk
     if rh is not None:
         if rh >= 95:
             score += 18
@@ -537,12 +546,10 @@ def wet_assess(
     else:
         reasons["Condensation / dew"].append("Missing humidity data.")
 
-    # Night factor (surfaces radiatively cool)
     if is_day is not None and int(is_day) == 0 and rh is not None and rh >= 80:
         score += 8
         reasons["Condensation / dew"].append("Nighttime + high humidity increases dew risk.")
 
-    # Wind dries
     if wind_mph is not None:
         if wind_mph >= 10:
             score -= 14 + adj["wind_dry_bonus"]
@@ -555,7 +562,6 @@ def wet_assess(
     else:
         reasons["Drying factors"].append("Missing wind data.")
 
-    # Time match uncertainty
     if matched_time_delta_minutes is not None:
         if matched_time_delta_minutes <= 15:
             reasons["Data quality"].append(f"Forecast time match: within {matched_time_delta_minutes} min.")
@@ -599,7 +605,6 @@ def qp_get():
     try:
         return st.query_params
     except Exception:
-        # older streamlit compatibility
         return {}
 
 
@@ -613,18 +618,11 @@ def qp_set(**kwargs):
             pass
 
 
-def parse_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
 # ----------------------------
 # UI
 # ----------------------------
 st.title("🏒 RinkWet")
-APP_VERSION = "v0.4.0"
+APP_VERSION = "v0.5.0"
 
 left, right = st.columns([4, 1])
 with left:
@@ -644,22 +642,15 @@ if "last_result" not in st.session_state:
 if "debug_safe" not in st.session_state:
     st.session_state.debug_safe = None
 if "favorites" not in st.session_state:
-    st.session_state.favorites = [
-        {"label": DEFAULT_LABEL, "lat": DEFAULT_LAT, "lon": DEFAULT_LON}
-    ]
+    st.session_state.favorites = [{"label": DEFAULT_LABEL, "lat": DEFAULT_LAT, "lon": DEFAULT_LON}]
 if "last_check_payload" not in st.session_state:
-    st.session_state.last_check_payload = None  # stores computed arrays for timeline/next-dry
-if "pending_observed" not in st.session_state:
-    st.session_state.pending_observed = None  # store selection before submit
+    st.session_state.last_check_payload = None
 if "geocode_results" not in st.session_state:
     st.session_state.geocode_results = []
-
-# >>> FIX: persist geocode selection across reruns
 if "geo_selected_idx" not in st.session_state:
     st.session_state.geo_selected_idx = 0
 if "geo_selected" not in st.session_state:
     st.session_state.geo_selected = None
-# <<<
 
 # Surface type toggle
 surface_type = st.selectbox(
@@ -677,11 +668,9 @@ shared_lat = parse_float(qp.get("lat")) if hasattr(qp, "get") else None
 shared_lon = parse_float(qp.get("lon")) if hasattr(qp, "get") else None
 shared_label = (qp.get("label") if hasattr(qp, "get") else None) or None
 
-# Favorites selector
 fav_labels = [f["label"] for f in st.session_state.favorites]
 fav_default_idx = 0
 
-# If shared rink exists, ensure it appears in favorites (session-only)
 if shared_lat is not None and shared_lon is not None and shared_label:
     if shared_label not in fav_labels:
         st.session_state.favorites.insert(0, {"label": shared_label, "lat": shared_lat, "lon": shared_lon})
@@ -691,38 +680,56 @@ if shared_lat is not None and shared_lon is not None and shared_label:
 selected_fav_label = st.selectbox("My rinks", fav_labels, index=fav_default_idx)
 selected_fav = next((f for f in st.session_state.favorites if f["label"] == selected_fav_label), None)
 
-# >>> FIX: robust "Search a different location" block (keys + persisted selection + error visibility)
+# Custom search
 use_custom = st.toggle("Search a different location", value=False)
 place = ""
 
 if use_custom:
     place = st.text_input(
-        "Search location",
-        placeholder="e.g., 'Ventura, CA' or 'Freedom Park Camarillo'",
+        "Search location (City/State, or paste coords like `34.21, -119.08`)",
+        placeholder="e.g., 'Ventura, CA' or '34.2138, -119.0856'",
         key="geo_query",
     )
 
-    colg1, colg2 = st.columns([1, 1])
+    colg1, _colg2 = st.columns([1, 1])
     if colg1.button("Search", key="geo_search_btn"):
         if not place.strip():
             st.warning("Type a location first.")
         else:
-            try:
-                with st.spinner("Searching locations..."):
-                    st.session_state.geocode_results = geocode(place.strip())
+            q = place.strip()
 
-                results = st.session_state.geocode_results or []
-                if not results:
-                    st.warning("No results. Try 'City, State' or a more specific name.")
+            ll = parse_latlon(q)
+            if ll:
+                lat, lon = ll
+                st.session_state.geocode_results = [{
+                    "name": "Custom coordinates",
+                    "admin1": "",
+                    "country": "",
+                    "latitude": lat,
+                    "longitude": lon,
+                }]
+                st.session_state.geo_selected_idx = 0
+                st.session_state.geo_selected = st.session_state.geocode_results[0]
+            else:
+                try:
+                    with st.spinner("Searching locations..."):
+                        st.session_state.geocode_results = geocode_with_fallback(q, count=10)
+
+                    results = st.session_state.geocode_results or []
+                    if not results:
+                        st.warning(
+                            "No results from the geocoder.\n\n"
+                            "Try **City, State** (example: `Ventura, CA`) or paste **coordinates** like `34.2138, -119.0856`."
+                        )
+                        st.session_state.geo_selected = None
+                    else:
+                        st.session_state.geo_selected_idx = 0
+                        st.session_state.geo_selected = results[0]
+                except Exception as e:
+                    st.error("Geocoding failed. Exact error:")
+                    st.code(str(e))
+                    st.session_state.geocode_results = []
                     st.session_state.geo_selected = None
-                else:
-                    st.session_state.geo_selected_idx = 0
-                    st.session_state.geo_selected = results[0]
-            except Exception as e:
-                st.error("Geocoding failed. Exact error:")
-                st.code(str(e))
-                st.session_state.geocode_results = []
-                st.session_state.geo_selected = None
 
     results = st.session_state.geocode_results or []
     if results:
@@ -771,55 +778,44 @@ if use_custom:
             except Exception as e:
                 st.error("Couldn’t set link parameters. Exact error:")
                 st.code(str(e))
-    else:
-        # If user toggles on but hasn't searched yet, keep selection empty
-        st.session_state.geo_selected = None
 else:
     st.session_state.geo_selected = None
-# <<<
 
 
-# Time inputs
-now_local = datetime.now(RINK_TZ)
-today_local = now_local.date()
-max_day = today_local + timedelta(days=MAX_FORECAST_DAYS - 1)
-
-if mode == "Now (arrival in X minutes)":
-    arrival_min = st.slider("Arriving in (minutes)", 0, 180, 20, 5)
-    target_dt = now_local + timedelta(minutes=arrival_min)
-else:
-    d = st.date_input("Date", value=today_local, min_value=today_local, max_value=max_day)
-    next_hour = (now_local + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-    t = st.time_input("Time", value=next_hour.time())
-    target_dt = datetime.combine(d, t).replace(tzinfo=RINK_TZ)
-
-st.caption(f"Target time (America/Los_Angeles): {target_dt.strftime('%Y-%m-%d %H:%M')}")
-
-# Determine which location we’re using
 def resolve_location():
-    # >>> FIX: use persisted selection instead of local var (survives reruns)
     if use_custom and st.session_state.get("geo_selected"):
-        chosen_geo = st.session_state.geo_selected
-        lat = float(chosen_geo["latitude"])
-        lon = float(chosen_geo["longitude"])
-        label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
+        g = st.session_state.geo_selected
+        lat = float(g["latitude"])
+        lon = float(g["longitude"])
+        label = f'{g.get("name","")} {g.get("admin1","")} {g.get("country","")}'.strip()
         return label, lat, lon
-    # <<<
     if selected_fav:
         return selected_fav["label"], float(selected_fav["lat"]), float(selected_fav["lon"])
     return DEFAULT_LABEL, DEFAULT_LAT, DEFAULT_LON
+
+
+# Time inputs (NOTE: we’ll display + compute in the selected location’s timezone after Check)
+# We keep UI inputs naive for now, and interpret them as “location local time” at runtime.
+now_fallback = datetime.now(ZoneInfo(DEFAULT_TZ))
+today_fallback = now_fallback.date()
+max_day = today_fallback + timedelta(days=MAX_FORECAST_DAYS - 1)
+
+if mode == "Now (arrival in X minutes)":
+    arrival_min = st.slider("Arriving in (minutes)", 0, 180, 20, 5)
+    target_naive = now_fallback + timedelta(minutes=arrival_min)
+else:
+    d = st.date_input("Date", value=today_fallback, min_value=today_fallback, max_value=max_day)
+    next_hour = (now_fallback + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    t = st.time_input("Time", value=next_hour.time())
+    target_naive = datetime.combine(d, t)
+
+st.caption("Target time will be interpreted in the selected location’s local timezone after you press **Check**.")
 
 
 # ----------------------------
 # Check computation
 # ----------------------------
 def compute_hourly_scores_for_window(hourly: dict, times_local: list[datetime], start_idx: int, hours: int, surface_type: str):
-    """
-    Compute wet scores for a window of hourly indices using:
-      - hourly temp/rh/dew/wind/is_day
-      - precip recent window = sum of last 3 hourly precip buckets
-    Returns list of dicts: {"dt": datetime, "score": int, "verdict": str}
-    """
     out = []
     precip_arr = (hourly or {}).get("precipitation") or []
 
@@ -845,7 +841,7 @@ def compute_hourly_scores_for_window(hourly: dict, times_local: list[datetime], 
 
         precip_last3h = sum_recent(precip_arr, i, lookback=3) if precip_arr else None
 
-        verdict, score, _reasons = wet_assess(
+        verdict, score, _ = wet_assess(
             temp_f=temp_f,
             dew_f=dew_f,
             rh=rh,
@@ -863,24 +859,42 @@ def compute_hourly_scores_for_window(hourly: dict, times_local: list[datetime], 
 if st.button("Check"):
     try:
         label, lat, lon = resolve_location()
-        forecast_days = needed_forecast_days_for(target_dt)
+
+        # First call: get weather (and timezone for THIS location)
+        wx_tmp = fetch_weather(lat, lon, forecast_days=1)
+        tz_name = (wx_tmp.get("timezone") or DEFAULT_TZ).strip()
+        tz_loc = ZoneInfo(tz_name)
+
+        now_local = datetime.now(tz_loc)
+
+        # Reinterpret the UI target as location-local time
+        if mode == "Now (arrival in X minutes)":
+            target_dt = now_local + timedelta(minutes=arrival_min)
+        else:
+            target_dt = target_naive.replace(tzinfo=tz_loc)
+
+        forecast_days = needed_forecast_days_for(target_dt, now_local)
         wx = fetch_weather(lat, lon, forecast_days=forecast_days)
+
+        # Use timezone from this full response
+        tz_name = (wx.get("timezone") or tz_name).strip()
+        tz_loc = ZoneInfo(tz_name)
 
         # 15-min block for "Now"
         m15 = wx.get("minutely_15") or {}
         m15_times_raw = m15.get("time") or []
-        m15_times_local = parse_times_local(m15_times_raw)
-        i_now_m15 = pick_index(m15_times_local, datetime.now(RINK_TZ)) if m15_times_local else 0
+        m15_times_local = parse_times_local(m15_times_raw, tz_loc)
+        i_now_m15 = pick_index(m15_times_local, datetime.now(tz_loc)) if m15_times_local else 0
         used_m15_time = m15_times_raw[i_now_m15] if m15_times_raw else ""
 
         delta_now_min = None
         if m15_times_local:
-            delta_now_min = int(round(abs((m15_times_local[i_now_m15] - datetime.now(RINK_TZ)).total_seconds()) / 60))
+            delta_now_min = int(round(abs((m15_times_local[i_now_m15] - datetime.now(tz_loc)).total_seconds()) / 60))
 
         # Hourly for target + planning
         hourly = wx.get("hourly") or {}
         h_times_raw = hourly.get("time") or []
-        h_times_local = parse_times_local(h_times_raw)
+        h_times_local = parse_times_local(h_times_raw, tz_loc)
         i_t_h = pick_index(h_times_local, target_dt) if h_times_local else 0
         used_h_time = h_times_raw[i_t_h] if h_times_raw else ""
 
@@ -888,13 +902,11 @@ if st.button("Check"):
         if h_times_local:
             delta_t_min = int(round(abs((h_times_local[i_t_h] - target_dt).total_seconds()) / 60))
 
-        # ----------------------------
-        # NOW (consistent 15-min)
-        # ----------------------------
+        # NOW (15-min)
         temp_c_now = at(m15, "temperature_2m", i_now_m15)
         rh_now = at(m15, "relative_humidity_2m", i_now_m15)
         wind_kmh_now = at(m15, "wind_speed_10m", i_now_m15)
-        precip_now_15 = at(m15, "precipitation", i_now_m15)  # preceding 15-min sum (mm)
+        precip_now_15 = at(m15, "precipitation", i_now_m15)
         dew_c_now = at(m15, "dew_point_2m", i_now_m15)
         is_day_now = at(m15, "is_day", i_now_m15)
 
@@ -921,13 +933,11 @@ if st.button("Check"):
 
         now_conf = compute_confidence(delta_now_min, dew_source_now, precip_now_15 is not None)
 
-        # ----------------------------
-        # TARGET (hourly + recent rain window)
-        # ----------------------------
+        # TARGET (hourly)
         temp_c_t = at(hourly, "temperature_2m", i_t_h)
         rh_t = at(hourly, "relative_humidity_2m", i_t_h)
         wind_kmh_t = at(hourly, "wind_speed_10m", i_t_h)
-        precip_t_1h = at(hourly, "precipitation", i_t_h)  # preceding hour sum (mm)
+        precip_t_1h = at(hourly, "precipitation", i_t_h)
         dew_c_t = at(hourly, "dew_point_2m", i_t_h)
         is_day_t = at(hourly, "is_day", i_t_h)
 
@@ -956,7 +966,6 @@ if st.button("Check"):
             surface_type=surface_type,
         )
 
-        # Add explicit target-hour precip note
         if precip_last1h is not None:
             reasons_t["Rain / recent moisture"].insert(
                 0, f"Target-hour precipitation bucket: {precip_last1h:.2f} mm (preceding 1 hour sum)."
@@ -964,7 +973,6 @@ if st.button("Check"):
 
         target_conf = compute_confidence(delta_t_min, dew_source_t, precip_last1h is not None or precip_last3h is not None)
 
-        # Save for feedback + planning tools
         st.session_state.last_result = {
             "label": label,
             "lat": lat,
@@ -975,21 +983,19 @@ if st.button("Check"):
             "surface_type": surface_type,
         }
 
-        # Planning window (timeline + next-dry)
-        # start from current nearest hourly index for timeline
-        i_now_h = pick_index(h_times_local, datetime.now(RINK_TZ)) if h_times_local else 0
+        i_now_h = pick_index(h_times_local, datetime.now(tz_loc)) if h_times_local else 0
         window = compute_hourly_scores_for_window(hourly, h_times_local, start_idx=i_now_h, hours=12, surface_type=surface_type)
         st.session_state.last_check_payload = {
             "hourly_window": window,
-            "hourly_used_start_idx": i_now_h,
             "label": label,
             "lat": lat,
             "lon": lon,
+            "timezone": tz_name,
         }
 
-        # Debug info
         st.session_state.debug_safe = {
-            "now_local": datetime.now(RINK_TZ).strftime("%Y-%m-%d %H:%M %Z"),
+            "timezone_used": tz_name,
+            "now_local": datetime.now(tz_loc).strftime("%Y-%m-%d %H:%M %Z"),
             "target_dt": target_dt.strftime("%Y-%m-%d %H:%M %Z"),
             "m15_index_now": i_now_m15,
             "hourly_index_target": i_t_h,
@@ -1005,12 +1011,10 @@ if st.button("Check"):
             "surface_type": surface_type,
         }
 
-        # ----------------------------
         # Display
-        # ----------------------------
         st.subheader(f"📍 {label}")
+        st.caption(f"Local time zone for this location: **{tz_name}**")
 
-        # Community notes (last 5)
         with st.expander("🗒️ Rink notes (latest)", expanded=False):
             try:
                 notes = read_recent_notes(label, limit=5)
@@ -1025,7 +1029,6 @@ if st.button("Check"):
             st.divider()
             st.write("Add a note (helps everyone):")
 
-            # >>> FIX: stable keys + show exact error + clear input on success
             nt = st.selectbox(
                 "Note type",
                 ["Irrigation", "Shade", "Drainage", "Sticky spot", "Other"],
@@ -1044,11 +1047,10 @@ if st.button("Check"):
                     try:
                         append_note(label, nt, ntext.strip())
                         st.success("Note added. Thanks.")
-                        st.session_state[f"note_text::{label}"] = ""  # clear text box
+                        st.session_state[f"note_text::{label}"] = ""
                     except Exception as e:
                         st.error("Couldn’t write note. Exact error:")
                         st.code(str(e))
-            # <<<
 
         st.write("**Now (15-minute snapshot)**")
         cols = st.columns(5)
@@ -1089,7 +1091,6 @@ if st.button("Check"):
                 st.success(f"{verdict_t} (Risk: {score_t}/100)")
             st.caption(action_recommendation(verdict_t, surface_type))
 
-        # Grouped reasons (more scannable)
         st.write("**Why (target):**")
         for group, items in reasons_t.items():
             if not items:
@@ -1099,39 +1100,26 @@ if st.button("Check"):
                 st.write(f"- {it}")
 
         if used_h_time:
-            st.caption(f"Target forecast hour used (America/Los_Angeles): {used_h_time}  (match: ±{delta_t_min} min)")
+            st.caption(f"Target forecast hour used (local): {used_h_time}  (match: ±{delta_t_min} min)")
 
-        # ----------------------------
-        # Timeline chart (next 12 hours)
-        # ----------------------------
         payload = st.session_state.get("last_check_payload") or {}
         window = payload.get("hourly_window") or []
         if window:
             st.subheader("📈 Next 12 hours risk trend")
-            times = [w["dt"].strftime("%H:%M") for w in window]
             scores = [w["score"] for w in window]
             st.line_chart({"Wet risk (0–100)": scores})
 
-            # show labels underneath for context
-            with st.expander("Show times used"):
-                st.write(", ".join(times))
-
-        # ----------------------------
-        # Next dry window (planner)
-        # ----------------------------
         st.subheader("🕒 When will it be driest?")
         if st.button("Find next driest window"):
             if not window:
                 st.info("Run a check first.")
             else:
-                # choose best 2 hours (lowest risk)
                 ranked = sorted(window, key=lambda x: x["score"])
                 top = ranked[:2]
                 st.write("Best upcoming windows (lowest risk):")
                 for tbest in top:
                     st.write(f"- **{tbest['dt'].strftime('%a %H:%M')}** — {tbest['verdict']} ({tbest['score']}/100)")
 
-        # Save shareable link for current rink quickly
         with st.expander("🔗 Share this rink link"):
             st.write("This adds rink coordinates to the URL so someone else opens the same rink by default.")
             if st.button("Update URL with this rink"):
@@ -1162,11 +1150,8 @@ try:
     if not last:
         st.info("Run a check first, then vote 👍 or 👎 based on what you actually saw at the rink.")
     else:
-        st.caption(
-            f"Last check: {last['label']} @ {last['target_local']} → {last['verdict']} ({last['score']}/100)"
-        )
+        st.caption(f"Last check: {last['label']} @ {last['target_local']} → {last['verdict']} ({last['score']}/100)")
 
-        # Ask for observed condition (enables real accuracy)
         observed = st.selectbox(
             "What was it actually?",
             ["(choose)", "Dry", "Damp/Borderline", "Wet"],
@@ -1203,18 +1188,11 @@ try:
             refresh_feedback_stats()
             st.success("Logged 👎. Thank you for your feedback.")
 
-        # Confusion matrix (if we have observed labels)
         if stats.get("cm"):
             with st.expander("📊 Model report (observed vs predicted)"):
                 st.write("Rows = predicted, Columns = observed")
                 cm = stats["cm"]
-                st.write(
-                    {
-                        "pred_dry": cm["dry"],
-                        "pred_damp": cm["damp"],
-                        "pred_wet": cm["wet"],
-                    }
-                )
+                st.write({"pred_dry": cm["dry"], "pred_damp": cm["damp"], "pred_wet": cm["wet"]})
         else:
             st.caption("Tip: pick an observed condition above to enable true accuracy tracking over time.")
 
