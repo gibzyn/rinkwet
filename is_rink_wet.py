@@ -22,7 +22,7 @@ RINK_TZ = ZoneInfo("America/Los_Angeles")  # PST/PDT automatically
 # ----------------------------
 # Streamlit setup
 # ----------------------------
-st.set_page_config(page_title="RinkWet", page_icon="🛼", layout="centered")
+st.set_page_config(page_title="RinkWet", page_icon="🏒", layout="centered")
 
 
 # ----------------------------
@@ -512,3 +512,4 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, or microclimate. Use at your own risk."
 )
+
