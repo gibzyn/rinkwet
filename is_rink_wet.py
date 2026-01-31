@@ -48,7 +48,7 @@ _SESSION = requests.Session()
 # - rate limit (don’t hammer)
 NOMINATIM_HEADERS = {
     # Replace contact if you want, but keep it descriptive
-    "User-Agent": f"RinkWet/0.5.0 (+{APP_URL})"
+    "User-Agent": f"RinkWet/0.5.1 (+{APP_URL})"
 }
 _NOMINATIM_MIN_INTERVAL_SEC = 1.0  # conservative: ~1 request/sec
 
@@ -328,7 +328,7 @@ def append_note(label: str, note_type: str, note_text: str):
 
 
 # ----------------------------
-# Location helpers (lat/lon + geocode fallback)
+# Location helpers (lat/lon + geocode fallback + timezone derivation)
 # ----------------------------
 def parse_float(x):
     try:
@@ -429,12 +429,90 @@ def _norm_admin_country_from_nominatim(addr: dict):
     return admin, country
 
 
+def _build_nominatim_queries(original: str) -> list[str]:
+    """
+    Nominatim is picky. Try a few variants before giving up.
+    Goal: make 'SB ... rink ...' style inputs resolve.
+    """
+    q = (original or "").strip()
+    if not q:
+        return []
+
+    out = []
+
+    # 1) Original
+    out.append(q)
+
+    # 2) Simplified punctuation
+    q2 = simplify_query(q)
+    if q2 and q2 != q:
+        out.append(q2)
+
+    # 3) Expand common abbreviation: SB -> Santa Barbara
+    # Only if it looks like "SB ..." and doesn't already contain "Santa Barbara"
+    q_lower = q.lower()
+    if q_lower.startswith("sb ") and "santa barbara" not in q_lower:
+        out.append("Santa Barbara " + q[3:])
+        out.append("Santa Barbara, CA " + q[3:])
+
+    # 4) Remove generic words that sometimes hurt matching
+    # (we keep "hockey" / city/state, but drop "rink" sometimes)
+    for drop in [" rink", " roller", " inline", " hockey"]:
+        qq = q2.lower()
+        if drop in qq:
+            # Remove the token but keep the rest
+            cleaned = " ".join([w for w in q2.split() if w.lower() != drop.strip()])
+            cleaned = " ".join(cleaned.split())
+            if cleaned and cleaned not in out:
+                out.append(cleaned)
+
+    # 5) Add helpful hints if query is short / ambiguous
+    if len(q2.split()) <= 6:
+        if "hockey" not in q_lower:
+            out.append(q2 + " hockey")
+        if "inline" not in q_lower:
+            out.append(q2 + " inline hockey")
+        if "roller" not in q_lower:
+            out.append(q2 + " roller hockey")
+
+    # De-dupe while preserving order
+    deduped = []
+    for s in out:
+        s2 = " ".join((s or "").split())
+        if s2 and s2 not in deduped:
+            deduped.append(s2)
+    return deduped[:6]
+
+
+@st.cache_data(ttl=60 * 60 * 24 * 30)  # 30 days
+def tz_from_coords(lat: float, lon: float) -> str:
+    """
+    Derive an IANA timezone for any lat/lon using Open-Meteo.
+    Uses timezone=auto, then reads 'timezone' field from response.
+    Cached to avoid repeated calls.
+    """
+    data = request_json(
+        OPEN_METEO_FORECAST,
+        params={
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "timezone": "auto",
+            "forecast_days": 1,
+            "current": "temperature_2m",
+        },
+        timeout=15,
+        retries=2,
+    )
+    tz = (data.get("timezone") or "").strip()
+    return tz or DEFAULT_TZ
+
+
 def geocode_with_fallback(query: str, count: int = 10):
     """
     Strategy:
       1) Open-Meteo (great for cities/regions)
       2) Open-Meteo with simplified query
-      3) Nominatim (great for POI/business names)
+      3) Nominatim (great for POI/business names) with multiple variants
     Returns a unified list of result dicts.
     """
     q = (query or "").strip()
@@ -446,6 +524,8 @@ def geocode_with_fallback(query: str, count: int = 10):
     if r1:
         for r in r1:
             r["source"] = "open-meteo"
+            # open-meteo uses these keys:
+            # latitude, longitude, timezone, name, admin1, country
         return r1
 
     # 2) Open-Meteo simplified
@@ -457,32 +537,46 @@ def geocode_with_fallback(query: str, count: int = 10):
                 r["source"] = "open-meteo"
             return r2
 
-    # 3) Nominatim fallback
-    nom = nominatim_search(q, limit=min(6, count))
+    # 3) Nominatim fallback (try several query variants)
+    variants = _build_nominatim_queries(q)
     out = []
-    for r in nom:
-        try:
-            lat = float(r.get("lat"))
-            lon = float(r.get("lon"))
-            display = (r.get("display_name") or "").strip()
-            addr = r.get("address") or {}
-            admin1, country = _norm_admin_country_from_nominatim(addr)
+    seen = set()
 
-            # Use first chunk for short name
-            short = display.split(",")[0].strip() if display else "Unknown place"
-            out.append(
-                {
-                    "name": short,
-                    "admin1": admin1,
-                    "country": country,
-                    "latitude": lat,
-                    "longitude": lon,
-                    "display_name": display,
-                    "source": "nominatim",
-                }
-            )
-        except Exception:
-            continue
+    for vq in variants:
+        nom = nominatim_search(vq, limit=min(6, count))
+        for r in nom:
+            try:
+                lat = float(r.get("lat"))
+                lon = float(r.get("lon"))
+                display = (r.get("display_name") or "").strip()
+                addr = r.get("address") or {}
+                admin1, country = _norm_admin_country_from_nominatim(addr)
+
+                short = display.split(",")[0].strip() if display else "Unknown place"
+
+                key = (round(lat, 5), round(lon, 5), short.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                out.append(
+                    {
+                        "name": short,
+                        "admin1": admin1,
+                        "country": country,
+                        "latitude": lat,
+                        "longitude": lon,
+                        "display_name": display,
+                        "source": "nominatim",
+                        "timezone": None,  # filled lazily when selected / used
+                    }
+                )
+            except Exception:
+                continue
+
+        # If we got any results on a variant, stop early
+        if out:
+            break
 
     return out
 
@@ -494,7 +588,6 @@ def fetch_weather(lat: float, lon: float, forecast_days: int):
     """
     IMPORTANT:
       - timezone="auto" makes Open-Meteo return times in the *location's* timezone
-        (Florida -> Eastern, etc.)
       - hourly.precipitation is the preceding hour sum (mm)
       - minutely_15.precipitation is the preceding 15 min sum (mm)
     """
@@ -831,6 +924,8 @@ if use_custom:
             ll = parse_latlon(q)
             if ll:
                 lat, lon = ll
+                # Derive timezone immediately for coords
+                tz_guess = tz_from_coords(lat, lon)
                 st.session_state.geocode_results = [{
                     "name": "Custom coordinates",
                     "admin1": "",
@@ -839,6 +934,7 @@ if use_custom:
                     "longitude": lon,
                     "display_name": "Custom coordinates",
                     "source": "coords",
+                    "timezone": tz_guess,
                 }]
                 st.session_state.geo_selected_idx = 0
                 st.session_state.geo_selected = st.session_state.geocode_results[0]
@@ -896,6 +992,16 @@ if use_custom:
         st.session_state.geo_selected = results[st.session_state.geo_selected_idx]
         chosen_geo = st.session_state.geo_selected
 
+        # Lazy-fill timezone for any selected result (Nominatim + coords especially)
+        try:
+            if not chosen_geo.get("timezone"):
+                chosen_geo["timezone"] = tz_from_coords(float(chosen_geo["latitude"]), float(chosen_geo["longitude"]))
+        except Exception:
+            chosen_geo["timezone"] = None
+
+        if chosen_geo.get("timezone"):
+            st.caption(f"Derived timezone for selected location: **{chosen_geo['timezone']}**")
+
         col_save, col_share = st.columns(2)
         if col_save.button("⭐ Save to My rinks", key="geo_save_btn"):
             try:
@@ -946,6 +1052,9 @@ else:
 
 
 def resolve_location():
+    """
+    Returns (label, lat, lon, tz_name_or_None)
+    """
     if use_custom and st.session_state.get("geo_selected"):
         g = st.session_state.geo_selected
         lat = float(g["latitude"])
@@ -961,16 +1070,16 @@ def resolve_location():
         if len(label) > 80:
             label = label[:77] + "..."
 
-        return label, lat, lon
+        tz_name = (g.get("timezone") or "").strip() or None
+        return label, lat, lon, tz_name
 
     if selected_fav:
-        return selected_fav["label"], float(selected_fav["lat"]), float(selected_fav["lon"])
+        return selected_fav["label"], float(selected_fav["lat"]), float(selected_fav["lon"]), None
 
-    return DEFAULT_LABEL, DEFAULT_LAT, DEFAULT_LON
+    return DEFAULT_LABEL, DEFAULT_LAT, DEFAULT_LON, DEFAULT_TZ
 
 
 # Time inputs (NOTE: we’ll display + compute in the selected location’s timezone after Check)
-# We keep UI inputs naive for now, and interpret them as “location local time” at runtime.
 now_fallback = datetime.now(ZoneInfo(DEFAULT_TZ))
 today_fallback = now_fallback.date()
 max_day = today_fallback + timedelta(days=MAX_FORECAST_DAYS - 1)
@@ -1033,11 +1142,10 @@ def compute_hourly_scores_for_window(hourly: dict, times_local: list[datetime], 
 
 if st.button("Check"):
     try:
-        label, lat, lon = resolve_location()
+        label, lat, lon, tz_hint = resolve_location()
 
-        # First call: get weather (and timezone for THIS location)
-        wx_tmp = fetch_weather(lat, lon, forecast_days=1)
-        tz_name = (wx_tmp.get("timezone") or DEFAULT_TZ).strip()
+        # Derive timezone from lat/lon (works for Open-Meteo, Nominatim, and pasted coords)
+        tz_name = (tz_hint or "").strip() or tz_from_coords(lat, lon)
         tz_loc = ZoneInfo(tz_name)
 
         now_local = datetime.now(tz_loc)
@@ -1051,7 +1159,7 @@ if st.button("Check"):
         forecast_days = needed_forecast_days_for(target_dt, now_local)
         wx = fetch_weather(lat, lon, forecast_days=forecast_days)
 
-        # Use timezone from this full response
+        # Use timezone from full response (should match tz_from_coords, but trust API if present)
         tz_name = (wx.get("timezone") or tz_name).strip()
         tz_loc = ZoneInfo(tz_name)
 
