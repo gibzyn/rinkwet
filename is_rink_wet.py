@@ -137,8 +137,11 @@ def get_worksheet_notes():
         return sh.worksheet("notes")
     except Exception:
         ws = sh.add_worksheet(title="notes", rows=1000, cols=10)
-        # New header includes lat/lon for stable rink identity
-        ws.append_row(["ts_utc", "label", "lat", "lon", "note_type", "note_text"], value_input_option="RAW")
+        # Preferred header includes 'key' + lat/lon for stable rink identity
+        ws.append_row(
+            ["ts_utc", "key", "label", "lat", "lon", "note_type", "note_text"],
+            value_input_option="RAW",
+        )
         return ws
 
 
@@ -276,35 +279,39 @@ def refresh_feedback_stats():
     read_feedback_stats.clear()
 
 
-# ---------- NOTES (FIXED + persistent) ----------
+# ---------- NOTES (FIXED for your schema: includes 'key' column) ----------
+def _notes_key(lat: float, lon: float) -> str:
+    # Stable widget-key so dropdown/input don’t reset unpredictably
+    return f"{float(lat):.5f},{float(lon):.5f}"
+
+
 def ensure_notes_header():
     """
-    Backward compatible for notes sheet:
-      Old: ts_utc,label,note_type,note_text
-      New: ts_utc,label,lat,lon,note_type,note_text
+    Supports multiple schemas:
+      - Preferred (your sheet): ts_utc,key,label,lat,lon,note_type,note_text
+      - Prior: ts_utc,label,lat,lon,note_type,note_text
+      - Old: ts_utc,label,note_type,note_text
 
-    If sheet is empty -> create NEW header.
-    If sheet exists with old header -> keep it (we won’t overwrite), but we’ll write old-format rows.
+    If empty -> write preferred header including 'key'.
+    Otherwise return existing header without overwriting.
     """
     ws = get_worksheet_notes()
     values = ws.get_all_values()
+
+    expected_pref = ["ts_utc", "key", "label", "lat", "lon", "note_type", "note_text"]
     expected_new = ["ts_utc", "label", "lat", "lon", "note_type", "note_text"]
     expected_old = ["ts_utc", "label", "note_type", "note_text"]
 
     if not values:
-        ws.append_row(expected_new, value_input_option="RAW")
-        return expected_new
+        ws.append_row(expected_pref, value_input_option="RAW")
+        return expected_pref
 
     header = [h.strip() for h in values[0]]
-    # If header matches neither, just return what exists (don’t clobber)
-    if header == expected_new or header == expected_old:
+    if header in (expected_pref, expected_new, expected_old):
         return header
+
+    # Unknown header — don't clobber it.
     return header
-
-
-def _notes_key(lat: float, lon: float) -> str:
-    # Stable widget-key so dropdown/input don’t reset unpredictably
-    return f"{float(lat):.5f},{float(lon):.5f}"
 
 
 @st.cache_data(ttl=10)
@@ -323,6 +330,7 @@ def read_recent_notes(label: str, lat: float | None, lon: float | None, limit: i
             return None
 
     ts_idx = idx("ts_utc")
+    key_idx = idx("key")
     label_idx = idx("label")
     lat_idx = idx("lat")
     lon_idx = idx("lon")
@@ -332,35 +340,65 @@ def read_recent_notes(label: str, lat: float | None, lon: float | None, limit: i
     def safe_get(row, i):
         return row[i] if i is not None and i < len(row) else ""
 
-    # If sheet supports lat/lon, match by coords; else match by label.
-    use_coords = (lat_idx is not None and lon_idx is not None and lat is not None and lon is not None)
+    def as_float(x):
+        try:
+            return float(str(x).strip())
+        except Exception:
+            return None
+
+    want_key = _notes_key(lat, lon) if (lat is not None and lon is not None) else None
 
     rows = []
     for r in values[1:]:
         if not r:
             continue
 
-        if use_coords:
-            try:
-                rlat = float((safe_get(r, lat_idx) or "").strip())
-                rlon = float((safe_get(r, lon_idx) or "").strip())
-                if abs(rlat - float(lat)) > 1e-4 or abs(rlon - float(lon)) > 1e-4:
-                    continue
-            except Exception:
-                continue
-        else:
-            if label_idx is None or label_idx >= len(r):
-                continue
-            if (r[label_idx] or "").strip() != (label or "").strip():
+        rts = (safe_get(r, ts_idx) or "").strip()
+        rlabel = (safe_get(r, label_idx) or "").strip()
+        rlat = as_float(safe_get(r, lat_idx))
+        rlon = as_float(safe_get(r, lon_idx))
+        rtype = (safe_get(r, type_idx) or "").strip()
+        rtext = (safe_get(r, text_idx) or "").strip()
+
+        # 1) Best: match by key if present
+        if key_idx is not None and want_key:
+            rkey = (safe_get(r, key_idx) or "").strip()
+            remember_key = rkey == want_key
+            if remember_key:
+                rows.append({"ts_utc": rts, "note_type": rtype, "note_text": rtext})
                 continue
 
-        rows.append(
-            {
-                "ts_utc": safe_get(r, ts_idx),
-                "note_type": safe_get(r, type_idx),
-                "note_text": safe_get(r, text_idx),
-            }
-        )
+        # 2) Next: match by coords if parseable
+        if lat is not None and lon is not None and rlat is not None and rlon is not None:
+            if abs(rlat - float(lat)) <= 1e-4 and abs(rlon - float(lon)) <= 1e-4:
+                rows.append({"ts_utc": rts, "note_type": rtype, "note_text": rtext})
+                continue
+
+        # 3) Fallback: match by label
+        if label and rlabel and rlabel == str(label).strip():
+            rows.append({"ts_utc": rts, "note_type": rtype, "note_text": rtext})
+            continue
+
+        # 4) Recovery: handle already-shifted rows caused by missing 'key' during writes
+        # Your sheet: ts_utc | key | label | lat | lon | note_type | note_text
+        # Shifted writes were: ts_utc, label, lat, lon, type, text (no key)
+        # So older rows look like:
+        #   ts_utc | (label in key) | (lat in label) | (lon in lat) | (type in lon) | (text in note_type) | note_text blank
+        if key_idx is not None and label_idx is not None and lat_idx is not None and lon_idx is not None and type_idx is not None:
+            shifted_lat = as_float(safe_get(r, label_idx))        # label col contains lat
+            shifted_lon = as_float(safe_get(r, lat_idx))          # lat col contains lon
+            shifted_type = (safe_get(r, lon_idx) or "").strip()   # lon col contains note_type
+            shifted_text = (safe_get(r, type_idx) or "").strip()  # note_type col contains note_text
+
+            if shifted_lat is not None and shifted_lon is not None and -90 <= shifted_lat <= 90 and -180 <= shifted_lon <= 180:
+                if lat is not None and lon is not None:
+                    if abs(shifted_lat - float(lat)) <= 1e-4 and abs(shifted_lon - float(lon)) <= 1e-4:
+                        rows.append({"ts_utc": rts, "note_type": shifted_type, "note_text": shifted_text})
+                        continue
+
+                if want_key and _notes_key(shifted_lat, shifted_lon) == want_key:
+                    rows.append({"ts_utc": rts, "note_type": shifted_type, "note_text": shifted_text})
+                    continue
 
     rows.reverse()
     return rows[:limit]
@@ -375,10 +413,22 @@ def append_note(label: str, lat: float | None, lon: float | None, note_type: str
     header = ensure_notes_header()
     ts_utc = datetime.utcnow().isoformat(timespec="seconds")
 
-    if "lat" in header and "lon" in header and lat is not None and lon is not None:
-        ws.append_row([ts_utc, label, float(lat), float(lon), note_type, note_text], value_input_option="RAW")
-    else:
-        ws.append_row([ts_utc, label, note_type, note_text], value_input_option="RAW")
+    row_dict = {
+        "ts_utc": ts_utc,
+        "label": label,
+        "lat": float(lat) if lat is not None else "",
+        "lon": float(lon) if lon is not None else "",
+        "note_type": note_type,
+        "note_text": note_text,
+    }
+
+    # If sheet has a 'key' column, populate it
+    if "key" in header:
+        row_dict["key"] = _notes_key(lat, lon) if (lat is not None and lon is not None) else ""
+
+    # Build row in the sheet's column order (handles extra columns safely)
+    row = [row_dict.get(col, "") for col in header]
+    ws.append_row(row, value_input_option="RAW")
 
     refresh_notes()
 
@@ -897,6 +947,7 @@ def render_last_check_ui():
         note_widget_key = f"note_text::{nk}"
         pending_key = f"pending::{note_widget_key}"
 
+        # Apply pending clear BEFORE widget is created
         if pending_key in st.session_state:
             st.session_state[note_widget_key] = st.session_state.pop(pending_key)
 
