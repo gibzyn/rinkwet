@@ -46,17 +46,11 @@ _SESSION = requests.Session()
 # Nominatim usage expectations:
 # - include a descriptive User-Agent
 # - rate limit (don’t hammer)
-NOMINATIM_HEADERS = {
-    "User-Agent": f"RinkWet/0.5.2 (+{APP_URL})"  # bumped for this fix
-}
+NOMINATIM_HEADERS = {"User-Agent": f"RinkWet/0.5.3 (+{APP_URL})"}
 _NOMINATIM_MIN_INTERVAL_SEC = 1.0  # conservative: ~1 request/sec
 
 
 def _throttle_nominatim():
-    """
-    Basic local throttle. Streamlit reruns can still cause multiple calls,
-    so we keep the throttle timestamp in session_state.
-    """
     last = st.session_state.get("_nominatim_last_ts", 0.0)
     now = time.time()
     wait = _NOMINATIM_MIN_INTERVAL_SEC - (now - last)
@@ -99,6 +93,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+NOTES_HEADER_V1 = ["ts_utc", "label", "note_type", "note_text"]
+NOTES_HEADER_V2 = ["ts_utc", "key", "label", "lat", "lon", "note_type", "note_text"]
+
 
 @st.cache_resource
 def get_gsheet_client():
@@ -129,15 +126,13 @@ def get_worksheet_feedback():
 
 @st.cache_resource
 def get_worksheet_notes():
-    """
-    Notes tab (create if missing). Safe to call; only creates if not present.
-    """
+    """Notes tab (create if missing)."""
     sh = get_spreadsheet()
     try:
         return sh.worksheet("notes")
     except Exception:
-        ws = sh.add_worksheet(title="notes", rows=1000, cols=10)
-        ws.append_row(["ts_utc", "label", "note_type", "note_text"], value_input_option="RAW")
+        ws = sh.add_worksheet(title="notes", rows=2000, cols=10)
+        ws.append_row(NOTES_HEADER_V2, value_input_option="RAW")
         return ws
 
 
@@ -172,7 +167,6 @@ def append_feedback_row(row_dict: dict):
         ws.append_row(header, value_input_option="RAW")
 
     row = [row_dict.get(col, "") for col in header]
-
     extra_keys = [k for k in row_dict.keys() if k not in header]
     if extra_keys:
         row.extend([row_dict[k] for k in extra_keys])
@@ -275,8 +269,47 @@ def refresh_feedback_stats():
     read_feedback_stats.clear()
 
 
+def _notes_key(lat: float, lon: float) -> str:
+    # stable key; rounding avoids tiny geocode jitter breaking lookups
+    return f"{float(lat):.5f},{float(lon):.5f}"
+
+
+def ensure_notes_header():
+    """
+    Notes header migration:
+      V1: ts_utc,label,note_type,note_text
+      V2: ts_utc,key,label,lat,lon,note_type,note_text
+    If missing header, create V2.
+    If V1 exists, keep it (don’t overwrite), but we can still write V2-style
+    rows by appending extra columns (Google Sheets allows it).
+    """
+    ws = get_worksheet_notes()
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(NOTES_HEADER_V2, value_input_option="RAW")
+        return NOTES_HEADER_V2
+
+    header = [h.strip() for h in (values[0] or [])]
+
+    # If the sheet exists but first row is blank-ish
+    if not any(header):
+        ws.update("A1", [NOTES_HEADER_V2])
+        return NOTES_HEADER_V2
+
+    # If already V2 (or contains 'key'), use it
+    if "key" in header and "note_text" in header:
+        return header
+
+    # If exactly V1, keep it
+    if header[:4] == NOTES_HEADER_V1:
+        return header
+
+    # Unknown header: do not overwrite
+    return header
+
+
 @st.cache_data(ttl=30)
-def read_recent_notes(label: str, limit: int = 5):
+def read_recent_notes(label: str, lat: float, lon: float, limit: int = 5):
     ws = get_worksheet_notes()
     values = ws.get_all_values()
     if not values or len(values) < 2:
@@ -291,18 +324,29 @@ def read_recent_notes(label: str, limit: int = 5):
             return None
 
     ts_idx = idx("ts_utc")
+    key_idx = idx("key")
     label_idx = idx("label")
     type_idx = idx("note_type")
     text_idx = idx("note_text")
+
+    k = _notes_key(lat, lon)
 
     rows = []
     for r in values[1:]:
         if not r:
             continue
-        if label_idx is None or label_idx >= len(r):
-            continue
-        if (r[label_idx] or "").strip() != label:
-            continue
+
+        # Prefer key matching if available
+        if key_idx is not None and key_idx < len(r) and (r[key_idx] or "").strip():
+            if (r[key_idx] or "").strip() != k:
+                continue
+        else:
+            # fallback to label matching (old sheet)
+            if label_idx is None or label_idx >= len(r):
+                continue
+            if (r[label_idx] or "").strip() != (label or "").strip():
+                continue
+
         rows.append(
             {
                 "ts_utc": r[ts_idx] if ts_idx is not None and ts_idx < len(r) else "",
@@ -319,10 +363,32 @@ def refresh_notes():
     read_recent_notes.clear()
 
 
-def append_note(label: str, note_type: str, note_text: str):
+def append_note(label: str, lat: float, lon: float, note_type: str, note_text: str):
     ws = get_worksheet_notes()
+    header = ensure_notes_header()
     ts_utc = datetime.utcnow().isoformat(timespec="seconds")
-    ws.append_row([ts_utc, label, note_type, note_text], value_input_option="RAW")
+    k = _notes_key(lat, lon)
+
+    row_dict = {
+        "ts_utc": ts_utc,
+        "key": k,
+        "label": label,
+        "lat": float(lat),
+        "lon": float(lon),
+        "note_type": note_type,
+        "note_text": note_text,
+    }
+
+    # If header is V1, it won’t have new columns; we append in header order and then extras.
+    if not header:
+        header = NOTES_HEADER_V2
+
+    row = [row_dict.get(col, "") for col in header]
+    extras = [c for c in NOTES_HEADER_V2 if c not in header]
+    if extras:
+        row.extend([row_dict.get(c, "") for c in extras])
+
+    ws.append_row(row, value_input_option="RAW")
     refresh_notes()
 
 
@@ -363,15 +429,11 @@ def parse_latlon(text: str):
 
 
 def simplify_query(q: str):
-    """
-    Light cleanup so Open-Meteo has a better chance, but don't over-strip.
-    """
     if not q:
         return q
     s = q.strip()
     for ch in ["|", "\\", "#", "@"]:
         s = s.replace(ch, " ")
-    # keep commas because "City, State" helps
     s = " ".join(s.split())
     return s
 
@@ -387,10 +449,6 @@ def geocode_open_meteo(query: str, count: int = 10):
 
 @st.cache_data(ttl=3600)
 def nominatim_search(query: str, limit: int = 6):
-    """
-    Free POI/name search fallback for rink/business-like queries.
-    TTL cached to reduce calls and avoid rate limiting.
-    """
     q = (query or "").strip()
     if not q:
         return []
@@ -402,7 +460,6 @@ def nominatim_search(query: str, limit: int = 6):
             "format": "json",
             "addressdetails": 1,
             "limit": limit,
-            # ✅ FIX: keep results in the US when users give a US query
             "countrycodes": "us",
         },
         timeout=15,
@@ -414,83 +471,51 @@ def nominatim_search(query: str, limit: int = 6):
 
 
 def _norm_admin_country_from_nominatim(addr: dict):
-    """
-    Extract something useful for display + saved label.
-    """
     if not isinstance(addr, dict):
         return "", ""
-    admin = (
-        addr.get("state")
-        or addr.get("province")
-        or addr.get("region")
-        or addr.get("county")
-        or ""
-    )
+    admin = addr.get("state") or addr.get("province") or addr.get("region") or addr.get("county") or ""
     country = addr.get("country") or ""
     return admin, country
 
 
 def _build_nominatim_queries(original: str) -> list[str]:
-    """
-    Nominatim is picky. Generate a few variants that improve hit-rate for:
-      - parks with "rink" in the user query
-      - "Outdoor Rink" style wording
-      - CA queries missing comma formatting
-    """
     q = (original or "").strip()
     if not q:
         return []
 
     out: list[str] = []
-
-    # 1) Original
     out.append(q)
 
-    # 2) Simplified punctuation
     q2 = simplify_query(q)
     if q2 and q2 != q:
         out.append(q2)
 
     q2_lower = q2.lower()
 
-    # 3) Expand common abbreviation: SB -> Santa Barbara
     if q2_lower.startswith("sb ") and "santa barbara" not in q2_lower:
         out.append("Santa Barbara " + q2[3:])
         out.append("Santa Barbara, CA " + q2[3:])
 
-    # 4) Strip common "junk" tokens that often reduce POI matching
-    #    (keep location tokens like Calabasas/CA/Street names etc.)
-    junk = {
-        "outdoor", "rink", "roller", "inline", "hockey", "ice", "arena",
-        "court", "skate", "skating",
-    }
-
+    junk = {"outdoor", "rink", "roller", "inline", "hockey", "ice", "arena", "court", "skate", "skating"}
     tokens = [t for t in q2.split() if t and t.lower() not in junk]
     cleaned = " ".join(tokens).strip()
     if cleaned and cleaned not in out:
         out.append(cleaned)
 
-    # 5) If we end with " CA" but no comma, try comma form
-    #    "De Anza Park Calabasas CA" -> "De Anza Park Calabasas, CA"
     if q2.endswith(" CA") and "," not in q2:
         out.append(q2[:-3].strip() + ", CA")
     if cleaned.endswith(" CA") and "," not in cleaned:
         out.append(cleaned[:-3].strip() + ", CA")
 
-    # 6) If the query mentions "park", try park-only + city/state (if present)
-    #    (This helps cases where the rink itself isn't mapped, but the park is.)
     if "park" in q2_lower:
         park_tokens = [t for t in q2.split() if t.lower() not in junk]
         park_clean = " ".join(park_tokens).strip()
         if park_clean and park_clean not in out:
             out.append(park_clean)
 
-    # 7) Small helpful hints if query is short / ambiguous
-    if len(q2.split()) <= 6:
-        if "park" not in q2_lower:
-            out.append(q2 + " park")
+    if len(q2.split()) <= 6 and "park" not in q2_lower:
+        out.append(q2 + " park")
 
-    # De-dupe while preserving order
     deduped: list[str] = []
     for s in out:
         s2 = " ".join((s or "").split())
@@ -500,13 +525,8 @@ def _build_nominatim_queries(original: str) -> list[str]:
     return deduped[:6]
 
 
-@st.cache_data(ttl=60 * 60 * 24 * 30)  # 30 days
+@st.cache_data(ttl=60 * 60 * 24 * 30)
 def tz_from_coords(lat: float, lon: float) -> str:
-    """
-    Derive an IANA timezone for any lat/lon using Open-Meteo.
-    Uses timezone=auto, then reads 'timezone' field from response.
-    Cached to avoid repeated calls.
-    """
     data = request_json(
         OPEN_METEO_FORECAST,
         params={
@@ -524,25 +544,16 @@ def tz_from_coords(lat: float, lon: float) -> str:
 
 
 def geocode_with_fallback(query: str, count: int = 10):
-    """
-    Strategy:
-      1) Open-Meteo (great for cities/regions)
-      2) Open-Meteo with simplified query
-      3) Nominatim (great for POI/business names) with multiple variants
-    Returns a unified list of result dicts.
-    """
     q = (query or "").strip()
     if not q:
         return []
 
-    # 1) Open-Meteo
     r1 = geocode_open_meteo(q, count=count)
     if r1:
         for r in r1:
             r["source"] = "open-meteo"
         return r1
 
-    # 2) Open-Meteo simplified
     q2 = simplify_query(q)
     if q2 != q:
         r2 = geocode_open_meteo(q2, count=count)
@@ -551,7 +562,6 @@ def geocode_with_fallback(query: str, count: int = 10):
                 r["source"] = "open-meteo"
             return r2
 
-    # 3) Nominatim fallback (try several query variants)
     variants = _build_nominatim_queries(q)
     out = []
     seen = set()
@@ -567,7 +577,6 @@ def geocode_with_fallback(query: str, count: int = 10):
                 admin1, country = _norm_admin_country_from_nominatim(addr)
 
                 short = display.split(",")[0].strip() if display else "Unknown place"
-
                 key = (round(lat, 5), round(lon, 5), short.lower())
                 if key in seen:
                     continue
@@ -582,13 +591,12 @@ def geocode_with_fallback(query: str, count: int = 10):
                         "longitude": lon,
                         "display_name": display,
                         "source": "nominatim",
-                        "timezone": None,  # filled lazily when selected / used
+                        "timezone": None,
                     }
                 )
             except Exception:
                 continue
 
-        # If we got any results on a variant, stop early
         if out:
             break
 
@@ -599,14 +607,7 @@ def geocode_with_fallback(query: str, count: int = 10):
 # Weather + scoring helpers
 # ----------------------------
 def fetch_weather(lat: float, lon: float, forecast_days: int):
-    """
-    IMPORTANT:
-      - timezone="auto" makes Open-Meteo return times in the *location's* timezone
-      - hourly.precipitation is the preceding hour sum (mm)
-      - minutely_15.precipitation is the preceding 15 min sum (mm)
-    """
     forecast_days = max(1, min(MAX_FORECAST_DAYS, int(forecast_days)))
-
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -635,7 +636,6 @@ def at(block: dict, key: str, idx: int):
 
 
 def parse_times_local(times: list[str], tz: ZoneInfo):
-    """Interpret Open-Meteo timezone-local strings as timezone-aware datetimes."""
     out = []
     for t in times or []:
         dt_naive = datetime.fromisoformat(t)
@@ -646,10 +646,7 @@ def parse_times_local(times: list[str], tz: ZoneInfo):
 def pick_index(times_local: list[datetime], target_dt_local: datetime) -> int:
     if not times_local:
         return 0
-    return min(
-        range(len(times_local)),
-        key=lambda i: abs((times_local[i] - target_dt_local).total_seconds()),
-    )
+    return min(range(len(times_local)), key=lambda i: abs((times_local[i] - target_dt_local).total_seconds()))
 
 
 def needed_forecast_days_for(target_dt_local: datetime, now_local: datetime) -> int:
@@ -858,7 +855,7 @@ def qp_set(**kwargs):
 # UI
 # ----------------------------
 st.title("🏒 RinkWet")
-APP_VERSION = "v0.5.2"
+APP_VERSION = "v0.5.3"
 
 left, right = st.columns([4, 1])
 with left:
@@ -938,7 +935,6 @@ if use_custom:
             ll = parse_latlon(q)
             if ll:
                 lat, lon = ll
-                # Derive timezone immediately for coords
                 tz_guess = tz_from_coords(lat, lon)
                 st.session_state.geocode_results = [{
                     "name": "Custom coordinates",
@@ -1005,7 +1001,6 @@ if use_custom:
         st.session_state.geo_selected = results[st.session_state.geo_selected_idx]
         chosen_geo = st.session_state.geo_selected
 
-        # Lazy-fill timezone for any selected result (Nominatim + coords especially)
         try:
             if not chosen_geo.get("timezone"):
                 chosen_geo["timezone"] = tz_from_coords(float(chosen_geo["latitude"]), float(chosen_geo["longitude"]))
@@ -1019,11 +1014,7 @@ if use_custom:
         if col_save.button("⭐ Save to My rinks", key="geo_save_btn"):
             try:
                 display_name = (chosen_geo.get("display_name") or "").strip()
-                if display_name:
-                    label = display_name
-                else:
-                    label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
-
+                label = display_name or f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
                 label = " ".join(label.split())
                 if len(label) > 80:
                     label = label[:77] + "..."
@@ -1043,10 +1034,7 @@ if use_custom:
         if col_share.button("🔗 Make shareable link", key="geo_share_btn"):
             try:
                 display_name = (chosen_geo.get("display_name") or "").strip()
-                if display_name:
-                    label = display_name
-                else:
-                    label = f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
+                label = display_name or f'{chosen_geo.get("name","")} {chosen_geo.get("admin1","")} {chosen_geo.get("country","")}'.strip()
                 label = " ".join(label.split())
                 if len(label) > 80:
                     label = label[:77] + "..."
@@ -1063,19 +1051,14 @@ else:
 
 
 def resolve_location():
-    """
-    Returns (label, lat, lon, tz_name_or_None)
-    """
+    """Returns (label, lat, lon, tz_name_or_None)"""
     if use_custom and st.session_state.get("geo_selected"):
         g = st.session_state.geo_selected
         lat = float(g["latitude"])
         lon = float(g["longitude"])
 
         display_name = (g.get("display_name") or "").strip()
-        if display_name:
-            label = display_name
-        else:
-            label = f'{g.get("name","")} {g.get("admin1","")} {g.get("country","")}'.strip()
+        label = display_name or f'{g.get("name","")} {g.get("admin1","")} {g.get("country","")}'.strip()
 
         label = " ".join(label.split())
         if len(label) > 80:
@@ -1090,7 +1073,7 @@ def resolve_location():
     return DEFAULT_LABEL, DEFAULT_LAT, DEFAULT_LON, DEFAULT_TZ
 
 
-# Time inputs (NOTE: we’ll display + compute in the selected location’s timezone after Check)
+# Time inputs
 now_fallback = datetime.now(ZoneInfo(DEFAULT_TZ))
 today_fallback = now_fallback.date()
 max_day = today_fallback + timedelta(days=MAX_FORECAST_DAYS - 1)
@@ -1107,9 +1090,6 @@ else:
 st.caption("Target time will be interpreted in the selected location’s local timezone after you press **Check**.")
 
 
-# ----------------------------
-# Check computation
-# ----------------------------
 def compute_hourly_scores_for_window(hourly: dict, times_local: list[datetime], start_idx: int, hours: int, surface_type: str):
     out = []
     precip_arr = (hourly or {}).get("precipitation") or []
@@ -1155,13 +1135,10 @@ if st.button("Check"):
     try:
         label, lat, lon, tz_hint = resolve_location()
 
-        # Derive timezone from lat/lon (works for Open-Meteo, Nominatim, and pasted coords)
         tz_name = (tz_hint or "").strip() or tz_from_coords(lat, lon)
         tz_loc = ZoneInfo(tz_name)
-
         now_local = datetime.now(tz_loc)
 
-        # Reinterpret the UI target as location-local time
         if mode == "Now (arrival in X minutes)":
             target_dt = now_local + timedelta(minutes=arrival_min)
         else:
@@ -1170,11 +1147,9 @@ if st.button("Check"):
         forecast_days = needed_forecast_days_for(target_dt, now_local)
         wx = fetch_weather(lat, lon, forecast_days=forecast_days)
 
-        # Use timezone from full response (should match tz_from_coords, but trust API if present)
         tz_name = (wx.get("timezone") or tz_name).strip()
         tz_loc = ZoneInfo(tz_name)
 
-        # 15-min block for "Now"
         m15 = wx.get("minutely_15") or {}
         m15_times_raw = m15.get("time") or []
         m15_times_local = parse_times_local(m15_times_raw, tz_loc)
@@ -1185,7 +1160,6 @@ if st.button("Check"):
         if m15_times_local:
             delta_now_min = int(round(abs((m15_times_local[i_now_m15] - datetime.now(tz_loc)).total_seconds()) / 60))
 
-        # Hourly for target + planning
         hourly = wx.get("hourly") or {}
         h_times_raw = hourly.get("time") or []
         h_times_local = parse_times_local(h_times_raw, tz_loc)
@@ -1224,7 +1198,6 @@ if st.button("Check"):
             matched_time_delta_minutes=delta_now_min,
             surface_type=surface_type,
         )
-
         now_conf = compute_confidence(delta_now_min, dew_source_now, precip_now_15 is not None)
 
         # TARGET (hourly)
@@ -1265,7 +1238,7 @@ if st.button("Check"):
                 0, f"Target-hour precipitation bucket: {precip_last1h:.2f} mm (preceding 1 hour sum)."
             )
 
-        target_conf = compute_confidence(delta_t_min, dew_source_t, precip_last1h is not None or precip_last3h is not None)
+        target_conf = compute_confidence(delta_t_min, dew_source_t, (precip_last1h is not None or precip_last3h is not None))
 
         st.session_state.last_result = {
             "label": label,
@@ -1291,8 +1264,6 @@ if st.button("Check"):
             "timezone_used": tz_name,
             "now_local": datetime.now(tz_loc).strftime("%Y-%m-%d %H:%M %Z"),
             "target_dt": target_dt.strftime("%Y-%m-%d %H:%M %Z"),
-            "m15_index_now": i_now_m15,
-            "hourly_index_target": i_t_h,
             "used_m15_time": used_m15_time,
             "used_hourly_time": used_h_time,
             "match_delta_now_min": delta_now_min,
@@ -1302,6 +1273,7 @@ if st.button("Check"):
             "label": label,
             "lat": round(float(lat), 5),
             "lon": round(float(lon), 5),
+            "notes_key": _notes_key(lat, lon),
             "surface_type": surface_type,
         }
 
@@ -1311,16 +1283,16 @@ if st.button("Check"):
 
         with st.expander("🗒️ Rink notes (latest)", expanded=False):
             try:
-                notes = read_recent_notes(label, limit=5)
+                ensure_notes_header()
+                notes = read_recent_notes(label, lat, lon, limit=5)
                 if not notes:
                     st.write("No notes yet.")
                 else:
                     for n in notes:
                         st.write(f"- **{n['note_type']}** — {n['note_text']}  _(UTC: {n['ts_utc']})_")
             except Exception as e:
-                    st.error("Notes not available. Exact error:")
-                    st.code(str(e))
-
+                st.error("Notes not available. Exact error:")
+                st.code(str(e))
 
             st.divider()
             st.write("Add a note (helps everyone):")
@@ -1329,21 +1301,21 @@ if st.button("Check"):
                 "Note type",
                 ["Irrigation", "Shade", "Drainage", "Sticky spot", "Other"],
                 index=0,
-                key=f"note_type::{label}",
+                key=f"note_type::{_notes_key(lat, lon)}",
             )
             ntext = st.text_input(
                 "Note",
                 placeholder="e.g., 'Back corner stays wet after rain' (keep it short)",
-                key=f"note_text::{label}",
+                key=f"note_text::{_notes_key(lat, lon)}",
             )
-            if st.button("Submit note", key=f"submit_note::{label}"):
+            if st.button("Submit note", key=f"submit_note::{_notes_key(lat, lon)}"):
                 if not ntext.strip():
                     st.warning("Type a note first.")
                 else:
                     try:
-                        append_note(label, nt, ntext.strip())
+                        append_note(label, lat, lon, nt, ntext.strip())
                         st.success("Note added. Thanks.")
-                        st.session_state[f"note_text::{label}"] = ""
+                        st.session_state[f"note_text::{_notes_key(lat, lon)}"] = ""
                     except Exception as e:
                         st.error("Couldn’t write note. Exact error:")
                         st.code(str(e))
@@ -1508,9 +1480,7 @@ with st.expander("📣 Share this app"):
     st.write("Share this link:")
     st.code(APP_URL, language="text")
 
-    qr_url = "https://api.qrserver.com/v1/create-qr-code/?" + urllib.parse.urlencode(
-        {"size": "220x220", "data": APP_URL}
-    )
+    qr_url = "https://api.qrserver.com/v1/create-qr-code/?" + urllib.parse.urlencode({"size": "220x220", "data": APP_URL})
     st.image(qr_url, caption="Scan to open RinkWet")
 
 with st.expander("Debug (safe)"):
@@ -1528,5 +1498,3 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, surface material, or microclimate. Use at your own risk."
 )
-
-
