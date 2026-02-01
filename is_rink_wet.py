@@ -936,11 +936,21 @@ def render_last_check_ui():
             index=0,
             key=f"note_type::{nk}",
         )
+
+        # -------- FIX: safe clear on submit (no illegal session_state write after widget instantiation)
+        note_widget_key = f"note_text::{nk}"
+        pending_key = f"pending::{note_widget_key}"
+
+        # Apply any pending value BEFORE the widget is created
+        if pending_key in st.session_state:
+            st.session_state[note_widget_key] = st.session_state.pop(pending_key)
+
         ntext = st.text_input(
             "Note",
             placeholder="e.g., 'Back corner stays wet after rain' (keep it short)",
-            key=f"note_text::{nk}",
+            key=note_widget_key,
         )
+
         if st.button("Submit note", key=f"submit_note::{nk}"):
             if not ntext.strip():
                 st.warning("Type a note first.")
@@ -948,10 +958,13 @@ def render_last_check_ui():
                 try:
                     append_note(label, lat, lon, nt, ntext.strip())
                     st.success("Note added. Thanks.")
-                    st.session_state[f"note_text::{nk}"] = ""
+                    # Queue clearing the text box safely and rerun
+                    st.session_state[pending_key] = ""
+                    st.rerun()
                 except Exception as e:
                     st.error("Couldn’t write note. Exact error:")
                     st.code(str(e))
+        # -------- /FIX
 
     st.write("**Now (15-minute snapshot)**")
     cols = st.columns(5)
