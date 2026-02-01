@@ -891,7 +891,7 @@ if "geo_selected" not in st.session_state:
 # Surface type toggle
 surface_type = st.selectbox(
     "Surface type",
-    ["Concrete (default)", "Sport court", "Tile (plastic)"],
+    ["Tile (default)", "Sport court", "Concrete"],
     index=0,
     help="This slightly tunes how dew and drying are weighted.",
 )
@@ -1526,3 +1526,4 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, surface material, or microclimate. Use at your own risk."
 )
+
