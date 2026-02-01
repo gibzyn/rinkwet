@@ -1317,8 +1317,10 @@ if st.button("Check"):
                 else:
                     for n in notes:
                         st.write(f"- **{n['note_type']}** — {n['note_text']}  _(UTC: {n['ts_utc']})_")
-            except Exception:
-                st.write("Notes not available.")
+            except Exception as e:
+                    st.error("Notes not available. Exact error:")
+                    st.code(str(e))
+
 
             st.divider()
             st.write("Add a note (helps everyone):")
@@ -1526,4 +1528,5 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, surface material, or microclimate. Use at your own risk."
 )
+
 
