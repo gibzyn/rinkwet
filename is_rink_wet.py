@@ -307,7 +307,7 @@ def _notes_key(lat: float, lon: float) -> str:
     return f"{float(lat):.5f},{float(lon):.5f}"
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=10)
 def read_recent_notes(label: str, lat: float | None, lon: float | None, limit: int = 5):
     ws = get_worksheet_notes()
     values = ws.get_all_values()
@@ -347,7 +347,6 @@ def read_recent_notes(label: str, lat: float | None, lon: float | None, limit: i
                 if abs(rlat - float(lat)) > 1e-4 or abs(rlon - float(lon)) > 1e-4:
                     continue
             except Exception:
-                # If a row is malformed, skip it
                 continue
         else:
             if label_idx is None or label_idx >= len(r):
@@ -376,11 +375,9 @@ def append_note(label: str, lat: float | None, lon: float | None, note_type: str
     header = ensure_notes_header()
     ts_utc = datetime.utcnow().isoformat(timespec="seconds")
 
-    # Decide write format based on sheet header
     if "lat" in header and "lon" in header and lat is not None and lon is not None:
         ws.append_row([ts_utc, label, float(lat), float(lon), note_type, note_text], value_input_option="RAW")
     else:
-        # Old format
         ws.append_row([ts_utc, label, note_type, note_text], value_input_option="RAW")
 
     refresh_notes()
@@ -423,15 +420,11 @@ def parse_latlon(text: str):
 
 
 def simplify_query(q: str):
-    """
-    Light cleanup so Open-Meteo has a better chance, but don't over-strip.
-    """
     if not q:
         return q
     s = q.strip()
     for ch in ["|", "\\", "#", "@"]:
         s = s.replace(ch, " ")
-    # keep commas because "City, State" helps
     s = " ".join(s.split())
     return s
 
@@ -447,10 +440,6 @@ def geocode_open_meteo(query: str, count: int = 10):
 
 @st.cache_data(ttl=3600)
 def nominatim_search(query: str, limit: int = 6):
-    """
-    Free POI/name search fallback for rink/business-like queries.
-    TTL cached to reduce calls and avoid rate limiting.
-    """
     q = (query or "").strip()
     if not q:
         return []
@@ -473,9 +462,6 @@ def nominatim_search(query: str, limit: int = 6):
 
 
 def _norm_admin_country_from_nominatim(addr: dict):
-    """
-    Extract something useful for display + saved label.
-    """
     if not isinstance(addr, dict):
         return "", ""
     admin = (
@@ -490,34 +476,23 @@ def _norm_admin_country_from_nominatim(addr: dict):
 
 
 def _build_nominatim_queries(original: str) -> list[str]:
-    """
-    Nominatim is picky. Generate a few variants that improve hit-rate for:
-      - parks with "rink" in the user query
-      - "Outdoor Rink" style wording
-      - CA queries missing comma formatting
-    """
     q = (original or "").strip()
     if not q:
         return []
 
     out: list[str] = []
-
-    # 1) Original
     out.append(q)
 
-    # 2) Simplified punctuation
     q2 = simplify_query(q)
     if q2 and q2 != q:
         out.append(q2)
 
     q2_lower = q2.lower()
 
-    # 3) Expand common abbreviation: SB -> Santa Barbara
     if q2_lower.startswith("sb ") and "santa barbara" not in q2_lower:
         out.append("Santa Barbara " + q2[3:])
         out.append("Santa Barbara, CA " + q2[3:])
 
-    # 4) Strip common "junk" tokens that often reduce POI matching
     junk = {
         "outdoor", "rink", "roller", "inline", "hockey", "ice", "arena",
         "court", "skate", "skating",
@@ -528,20 +503,17 @@ def _build_nominatim_queries(original: str) -> list[str]:
     if cleaned and cleaned not in out:
         out.append(cleaned)
 
-    # 5) If we end with " CA" but no comma, try comma form
     if q2.endswith(" CA") and "," not in q2:
         out.append(q2[:-3].strip() + ", CA")
     if cleaned.endswith(" CA") and "," not in cleaned:
         out.append(cleaned[:-3].strip() + ", CA")
 
-    # 6) If the query mentions "park", try park-only
     if "park" in q2_lower:
         park_tokens = [t for t in q2.split() if t.lower() not in junk]
         park_clean = " ".join(park_tokens).strip()
         if park_clean and park_clean not in out:
             out.append(park_clean)
 
-    # 7) Small helpful hints if query is short / ambiguous
     if len(q2.split()) <= 6:
         if "park" not in q2_lower:
             out.append(q2 + " park")
@@ -555,13 +527,8 @@ def _build_nominatim_queries(original: str) -> list[str]:
     return deduped[:6]
 
 
-@st.cache_data(ttl=60 * 60 * 24 * 30)  # 30 days
+@st.cache_data(ttl=60 * 60 * 24 * 30)
 def tz_from_coords(lat: float, lon: float) -> str:
-    """
-    Derive an IANA timezone for any lat/lon using Open-Meteo.
-    Uses timezone=auto, then reads 'timezone' field from response.
-    Cached to avoid repeated calls.
-    """
     data = request_json(
         OPEN_METEO_FORECAST,
         params={
@@ -579,25 +546,16 @@ def tz_from_coords(lat: float, lon: float) -> str:
 
 
 def geocode_with_fallback(query: str, count: int = 10):
-    """
-    Strategy:
-      1) Open-Meteo (great for cities/regions)
-      2) Open-Meteo with simplified query
-      3) Nominatim (great for POI/business names) with multiple variants
-    Returns a unified list of result dicts.
-    """
     q = (query or "").strip()
     if not q:
         return []
 
-    # 1) Open-Meteo
     r1 = geocode_open_meteo(q, count=count)
     if r1:
         for r in r1:
             r["source"] = "open-meteo"
         return r1
 
-    # 2) Open-Meteo simplified
     q2 = simplify_query(q)
     if q2 != q:
         r2 = geocode_open_meteo(q2, count=count)
@@ -606,7 +564,6 @@ def geocode_with_fallback(query: str, count: int = 10):
                 r["source"] = "open-meteo"
             return r2
 
-    # 3) Nominatim fallback
     variants = _build_nominatim_queries(q)
     out = []
     seen = set()
@@ -896,7 +853,7 @@ def qp_set(**kwargs):
 
 
 # ----------------------------
-# Persistent Results Renderer (FIX)
+# Persistent Results Renderer (kept)
 # ----------------------------
 def render_last_check_ui():
     ui = st.session_state.get("last_ui")
@@ -937,11 +894,9 @@ def render_last_check_ui():
             key=f"note_type::{nk}",
         )
 
-        # -------- FIX: safe clear on submit (no illegal session_state write after widget instantiation)
         note_widget_key = f"note_text::{nk}"
         pending_key = f"pending::{note_widget_key}"
 
-        # Apply any pending value BEFORE the widget is created
         if pending_key in st.session_state:
             st.session_state[note_widget_key] = st.session_state.pop(pending_key)
 
@@ -958,13 +913,11 @@ def render_last_check_ui():
                 try:
                     append_note(label, lat, lon, nt, ntext.strip())
                     st.success("Note added. Thanks.")
-                    # Queue clearing the text box safely and rerun
                     st.session_state[pending_key] = ""
                     st.rerun()
                 except Exception as e:
                     st.error("Couldn’t write note. Exact error:")
                     st.code(str(e))
-        # -------- /FIX
 
     st.write("**Now (15-minute snapshot)**")
     cols = st.columns(5)
@@ -1275,6 +1228,63 @@ def resolve_location():
     return DEFAULT_LABEL, DEFAULT_LAT, DEFAULT_LON, DEFAULT_TZ
 
 
+# ----------------------------
+# ✅ Option A: ALWAYS show notes for selected rink (even before Check)
+# ----------------------------
+st.subheader("🗒️ Rink notes (selected rink)")
+
+try:
+    label0, lat0, lon0, _tz0 = resolve_location()
+    ensure_notes_header()
+
+    notes0 = read_recent_notes(label0, lat0, lon0, limit=5)
+    if not notes0:
+        st.write("No notes yet for this rink.")
+    else:
+        for n in notes0:
+            st.write(f"- **{n['note_type']}** — {n['note_text']}  _(UTC: {n['ts_utc']})_")
+
+    st.divider()
+    st.write("Add a note (helps everyone):")
+
+    nk0 = _notes_key(lat0, lon0)
+
+    nt0 = st.selectbox(
+        "Note type",
+        ["Irrigation", "Shade", "Drainage", "Sticky spot", "Other"],
+        index=0,
+        key=f"note_type_selected::{nk0}",
+    )
+
+    note_widget_key0 = f"note_text_selected::{nk0}"
+    pending_key0 = f"pending::{note_widget_key0}"
+
+    # Apply pending clear BEFORE widget is created
+    if pending_key0 in st.session_state:
+        st.session_state[note_widget_key0] = st.session_state.pop(pending_key0)
+
+    ntext0 = st.text_input(
+        "Note",
+        placeholder="e.g., 'Back corner stays wet after rain' (keep it short)",
+        key=note_widget_key0,
+    )
+
+    if st.button("Submit note", key=f"submit_note_selected::{nk0}"):
+        if not ntext0.strip():
+            st.warning("Type a note first.")
+        else:
+            append_note(label0, lat0, lon0, nt0, ntext0.strip())
+            st.success("Note added. Thanks.")
+            st.session_state[pending_key0] = ""
+            st.rerun()
+
+except Exception as e:
+    st.error("Notes not available. Exact error:")
+    st.code(str(e))
+
+st.divider()
+
+
 # Time inputs
 now_fallback = datetime.now(ZoneInfo(DEFAULT_TZ))
 today_fallback = now_fallback.date()
@@ -1483,7 +1493,6 @@ if st.button("Check"):
             "surface_type": surface_type,
         }
 
-        # ✅ Persist UI so notes widgets don't make results disappear on rerun
         st.session_state.last_ui = {
             "label": label,
             "lat": float(lat),
