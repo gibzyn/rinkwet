@@ -658,6 +658,146 @@ def geocode_with_fallback(query: str, count: int = 10):
 # ----------------------------
 # Weather + scoring helpers
 # ----------------------------
+
+# ----------------------------
+# Model tuning (v0.6.0)
+# ----------------------------
+NIGHT_START_HOUR = 17  # 17:00
+NIGHT_END_HOUR = 8     # 08:00 (exclusive)
+GLOBAL_SCORE_OFFSET = -5  # apply to base score (calibration)
+NIGHT_SURFACE_COOL_F = 2.0  # slab temp proxy: effective_temp = air_temp - this
+MARINE_MAX_BONUS = 18  # max points added at night for marine layer signal (0..18)
+
+def in_night_window(local_dt: datetime) -> bool:
+    """Night window = 17:00–08:00 local time."""
+    h = int(local_dt.hour)
+    return (h >= NIGHT_START_HOUR) or (h < NIGHT_END_HOUR)
+
+def _clamp01(x: float) -> float:
+    return 0.0 if x <= 0 else (1.0 if x >= 1 else x)
+
+def marine_layer_index(
+    temp_f: float | None,
+    dew_f: float | None,
+    rh: float | None,
+    wind_mph: float | None,
+    cloud_pct: float | None,
+    wind_dir_deg: float | None = None,
+    # Default onshore sector (SW->NW). Tune later if needed.
+    onshore_dir_range: tuple[int, int] = (225, 315),
+) -> float:
+    """
+    0..1 proxy for marine-layer / fog deposition likelihood.
+    Uses only API-provided fields and is gated to night/early AM by caller.
+    """
+    if temp_f is None or dew_f is None:
+        return 0.0
+
+    spread = max(0.0, float(temp_f) - float(dew_f))
+
+    # RH factor (strong)
+    if rh is None:
+        rh_factor = 0.0
+    else:
+        # 80% => 0, 92% => ~0.67, 98% => 1
+        rh_factor = _clamp01((float(rh) - 80.0) / 18.0)
+
+    # Spread factor (marine can still matter at 4–7°F)
+    # 8°F => 0, 5°F => ~0.43, 3°F => ~0.71, 1°F => 1
+    spread_factor = _clamp01((8.0 - spread) / 7.0)
+
+    # Cloud factor (stratus)
+    if cloud_pct is None:
+        cloud_factor = 0.0
+    else:
+        # 40% => 0, 70% => 0.6, 90% => 1
+        cloud_factor = _clamp01((float(cloud_pct) - 40.0) / 50.0)
+
+    # Wind factor (advection sweet spot 2–10 mph)
+    if wind_mph is None:
+        wind_factor = 0.3
+    else:
+        wm = float(wind_mph)
+        if wm < 1.5:
+            wind_factor = 0.35
+        elif wm <= 10.0:
+            wind_factor = 1.0
+        else:
+            wind_factor = _clamp01(1.0 - (wm - 10.0) / 15.0)
+
+    # Optional onshore direction bonus
+    onshore_bonus = 0.0
+    if wind_dir_deg is not None:
+        lo, hi = onshore_dir_range
+        wd = float(wind_dir_deg) % 360
+        if lo <= hi:
+            onshore = (lo <= wd <= hi)
+        else:
+            onshore = (wd >= lo or wd <= hi)
+        onshore_bonus = 0.15 if onshore else 0.0
+
+    idx = (
+        0.45 * rh_factor +
+        0.25 * spread_factor +
+        0.20 * cloud_factor +
+        0.10 * wind_factor
+    )
+
+    return _clamp01(idx + onshore_bonus)
+
+def apply_post_adjustments(
+    base_score: int,
+    local_dt: datetime,
+    temp_f: float | None,
+    dew_f: float | None,
+    rh: float | None,
+    wind_mph: float | None,
+    cloud_pct: float | None,
+    wind_dir_deg: float | None,
+):
+    """Returns (adjusted_score, adjustment_notes:list[str])."""
+    notes: list[str] = []
+
+    # 1) Global calibration
+    score = int(base_score)
+    if GLOBAL_SCORE_OFFSET != 0:
+        score = max(0, score + GLOBAL_SCORE_OFFSET)
+        notes.append(f"Global calibration: {GLOBAL_SCORE_OFFSET:+d} points.")
+
+    # 2) Night-only slab proxy + marine layer
+    if in_night_window(local_dt) and temp_f is not None and dew_f is not None:
+        # Slab temp proxy
+        eff_temp = float(temp_f) - float(NIGHT_SURFACE_COOL_F)
+        eff_spread = eff_temp - float(dew_f)
+
+        slab_pts = 0
+        if eff_spread <= 2.0:
+            slab_pts = 18
+        elif eff_spread <= 5.0:
+            slab_pts = 10
+        elif eff_spread <= 8.0:
+            slab_pts = 5
+
+        # Calm wind tends to worsen surface wetting
+        if wind_mph is not None and float(wind_mph) <= 5.0:
+            slab_pts += 3
+
+        if slab_pts:
+            score += slab_pts
+            notes.append(
+                f"Night slab proxy: air−{NIGHT_SURFACE_COOL_F:.1f}°F → effective spread {eff_spread:.1f}°F (+{slab_pts})."
+            )
+
+        # Marine layer proxy
+        mli = marine_layer_index(temp_f, dew_f, rh, wind_mph, cloud_pct, wind_dir_deg)
+        marine_pts = int(round(MARINE_MAX_BONUS * mli))
+        if marine_pts:
+            score += marine_pts
+            notes.append(f"Marine layer boost: index={mli:.2f} (+{marine_pts}).")
+
+    score = max(0, min(100, int(round(score))))
+    return score, notes
+
 def fetch_weather(lat: float, lon: float, forecast_days: int):
     forecast_days = max(1, min(MAX_FORECAST_DAYS, int(forecast_days)))
     params = {
@@ -665,9 +805,9 @@ def fetch_weather(lat: float, lon: float, forecast_days: int):
         "longitude": lon,
         "timezone": "auto",
         "forecast_days": forecast_days,
-        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,is_day",
-        "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m,is_day",
-        "minutely_15": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m,is_day",
+        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m,cloud_cover,is_day",
+        "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m,wind_direction_10m,cloud_cover,is_day",
+        "minutely_15": "temperature_2m,relative_humidity_2m,dew_point_2m,precipitation,wind_speed_10m,wind_direction_10m,cloud_cover,is_day",
     }
     return request_json(OPEN_METEO_FORECAST, params=params, timeout=15, retries=2)
 
@@ -857,14 +997,23 @@ def wet_assess(
 
     score = max(0, min(100, int(round(score))))
 
-    if score >= 65:
+    if score >= 50:
         verdict = "YES — likely wet"
-    elif score >= 45:
+    elif score >= 21:
         verdict = "MAYBE — likely damp/borderline"
     else:
         verdict = "NO — likely dry"
 
     return verdict, score, reasons
+
+
+
+def verdict_from_score(score: int) -> str:
+    if score >= 50:
+        return "YES — likely wet"
+    if score >= 21:
+        return "MAYBE — likely damp/borderline"
+    return "NO — likely dry"
 
 
 def action_recommendation(verdict: str, surface_type: str):
@@ -991,9 +1140,9 @@ def render_last_check_ui():
 
     with colA:
         st.write("### Now verdict")
-        if ui["score_now"] >= 65:
+        if ui["score_now"] >= 50:
             st.error(ui["verdict_now_line"])
-        elif ui["score_now"] >= 45:
+        elif ui["score_now"] >= 21:
             st.warning(ui["verdict_now_line"])
         else:
             st.success(ui["verdict_now_line"])
@@ -1001,9 +1150,9 @@ def render_last_check_ui():
 
     with colB:
         st.write("### Target verdict")
-        if ui["score_t"] >= 65:
+        if ui["score_t"] >= 50:
             st.error(ui["verdict_t_line"])
-        elif ui["score_t"] >= 45:
+        elif ui["score_t"] >= 21:
             st.warning(ui["verdict_t_line"])
         else:
             st.success(ui["verdict_t_line"])
@@ -1028,35 +1177,7 @@ def render_last_check_ui():
     if st.button("Find next driest window"):
         window = ui.get("window_items") or []
         if not window:
-            st.info("Run a check first.")
-        else:
-            ranked = sorted(window, key=lambda x: x["score"])
-            top = ranked[:2]
-            st.write("Best upcoming windows (lowest risk):")
-            for tbest in top:
-                st.write(f"- **{tbest['dt'].strftime('%a %H:%M')}** — {tbest['verdict']} ({tbest['score']}/100)")
-
-    with st.expander("🔗 Share this rink link"):
-        st.write("This adds rink coordinates to the URL so someone else opens the same rink by default.")
-        if st.button("Update URL with this rink"):
-            qp_set(lat=f"{lat:.5f}", lon=f"{lon:.5f}", label=label)
-            st.success("URL updated. Copy from browser address bar.")
-
-
-# ----------------------------
-# UI
-# ----------------------------
-st.title("🏒 RinkWet")
-APP_VERSION = "v0.5.3"
-
-left, right = st.columns([4, 1])
-with left:
-    st.info(
-        "🚧 **UNDER DEVELOPMENT** — RinkWet is in active development. "
-        "Some features may be incomplete or temporarily unavailable.",
-        icon="🚧",
-    )
-with right:
+            with right:
     st.caption(f"**Version:** {APP_VERSION}")
 
 st.caption("Weather-based estimate for wet rink conditions (dew/condensation + recent rain + wind).")
@@ -1279,63 +1400,6 @@ def resolve_location():
     return DEFAULT_LABEL, DEFAULT_LAT, DEFAULT_LON, DEFAULT_TZ
 
 
-# ----------------------------
-# ✅ Option A: ALWAYS show notes for selected rink (even before Check)
-# ----------------------------
-st.subheader("🗒️ Rink notes (selected rink)")
-
-try:
-    label0, lat0, lon0, _tz0 = resolve_location()
-    ensure_notes_header()
-
-    notes0 = read_recent_notes(label0, lat0, lon0, limit=5)
-    if not notes0:
-        st.write("No notes yet for this rink.")
-    else:
-        for n in notes0:
-            st.write(f"- **{n['note_type']}** — {n['note_text']}  _(UTC: {n['ts_utc']})_")
-
-    st.divider()
-    st.write("Add a note (helps everyone):")
-
-    nk0 = _notes_key(lat0, lon0)
-
-    nt0 = st.selectbox(
-        "Note type",
-        ["Irrigation", "Shade", "Drainage", "Sticky spot", "Other"],
-        index=0,
-        key=f"note_type_selected::{nk0}",
-    )
-
-    note_widget_key0 = f"note_text_selected::{nk0}"
-    pending_key0 = f"pending::{note_widget_key0}"
-
-    # Apply pending clear BEFORE widget is created
-    if pending_key0 in st.session_state:
-        st.session_state[note_widget_key0] = st.session_state.pop(pending_key0)
-
-    ntext0 = st.text_input(
-        "Note",
-        placeholder="e.g., 'Back corner stays wet after rain' (keep it short)",
-        key=note_widget_key0,
-    )
-
-    if st.button("Submit note", key=f"submit_note_selected::{nk0}"):
-        if not ntext0.strip():
-            st.warning("Type a note first.")
-        else:
-            append_note(label0, lat0, lon0, nt0, ntext0.strip())
-            st.success("Note added. Thanks.")
-            st.session_state[pending_key0] = ""
-            st.rerun()
-
-except Exception as e:
-    st.error("Notes not available. Exact error:")
-    st.code(str(e))
-
-st.divider()
-
-
 # Time inputs
 now_fallback = datetime.now(ZoneInfo(DEFAULT_TZ))
 today_fallback = now_fallback.date()
@@ -1369,6 +1433,8 @@ def compute_hourly_scores_for_window(hourly: dict, times_local: list[datetime], 
         rh = at(hourly, "relative_humidity_2m", i)
         dew_c = at(hourly, "dew_point_2m", i)
         wind_kmh = at(hourly, "wind_speed_10m", i)
+        wind_dir = at(hourly, "wind_direction_10m", i)
+        cloud = at(hourly, "cloud_cover", i)
         is_day = at(hourly, "is_day", i)
 
         dew_source = "api"
@@ -1393,7 +1459,9 @@ def compute_hourly_scores_for_window(hourly: dict, times_local: list[datetime], 
             matched_time_delta_minutes=None,
             surface_type=surface_type,
         )
-        out.append({"dt": times_local[i], "score": score, "verdict": verdict, "dew_source": dew_source})
+        score_adj, _adj_notes = apply_post_adjustments(int(score), times_local[i], temp_f, dew_f, rh, wind_mph, cloud, wind_dir)
+        verdict = verdict_from_score(int(score_adj))
+        out.append({"dt": times_local[i], "score": score_adj, "verdict": verdict, "dew_source": dew_source})
     return out
 
 
@@ -1442,6 +1510,8 @@ if st.button("Check"):
         temp_c_now = at(m15, "temperature_2m", i_now_m15)
         rh_now = at(m15, "relative_humidity_2m", i_now_m15)
         wind_kmh_now = at(m15, "wind_speed_10m", i_now_m15)
+        wind_dir_now = at(m15, "wind_direction_10m", i_now_m15)
+        cloud_now = at(m15, "cloud_cover", i_now_m15)
         precip_now_15 = at(m15, "precipitation", i_now_m15)
         dew_c_now = at(m15, "dew_point_2m", i_now_m15)
         is_day_now = at(m15, "is_day", i_now_m15)
@@ -1465,6 +1535,20 @@ if st.button("Check"):
             is_day=is_day_now,
             matched_time_delta_minutes=delta_now_min,
             surface_type=surface_type,
+
+
+# Post-adjustments (global calibration + night slab proxy + marine layer) for NOW
+score_now_adj, adj_notes_now = apply_post_adjustments(
+    base_score=int(score_now),
+    local_dt=datetime.now(tz_loc),
+    temp_f=temp_f_now,
+    dew_f=dew_f_now,
+    rh=rh_now,
+    wind_mph=wind_mph_now,
+    cloud_pct=cloud_now,
+    wind_dir_deg=wind_dir_now,
+)
+score_now = score_now_adj
         )
 
         now_conf = compute_confidence(delta_now_min, dew_source_now, precip_now_15 is not None)
@@ -1473,6 +1557,8 @@ if st.button("Check"):
         temp_c_t = at(hourly, "temperature_2m", i_t_h)
         rh_t = at(hourly, "relative_humidity_2m", i_t_h)
         wind_kmh_t = at(hourly, "wind_speed_10m", i_t_h)
+        wind_dir_t = at(hourly, "wind_direction_10m", i_t_h)
+        cloud_t = at(hourly, "cloud_cover", i_t_h)
         precip_t_1h = at(hourly, "precipitation", i_t_h)
         dew_c_t = at(hourly, "dew_point_2m", i_t_h)
         is_day_t = at(hourly, "is_day", i_t_h)
@@ -1500,6 +1586,24 @@ if st.button("Check"):
             is_day=is_day_t,
             matched_time_delta_minutes=delta_t_min,
             surface_type=surface_type,
+
+
+# Post-adjustments (global calibration + night slab proxy + marine layer) for TARGET
+score_t_adj, adj_notes_t = apply_post_adjustments(
+    base_score=int(score_t),
+    local_dt=target_dt,
+    temp_f=temp_f_t,
+    dew_f=dew_f_t,
+    rh=rh_t,
+    wind_mph=wind_mph_t,
+    cloud_pct=cloud_t,
+    wind_dir_deg=wind_dir_t,
+)
+score_t = score_t_adj
+# Surface adjustment notes for transparency/debug
+if adj_notes_t:
+    reasons_t.setdefault("Night / marine adjustments", [])
+    reasons_t["Night / marine adjustments"].extend(adj_notes_t)
         )
 
         if precip_last1h is not None:
@@ -1592,14 +1696,14 @@ render_last_check_ui()
 # Feedback UI (Google Sheets)
 # ----------------------------
 st.divider()
-st.subheader("✅ Was the prediction accurate?")
+st.subheader("✅ Accuracy (user ratings)")
 
 try:
     stats = read_feedback_stats()
     a, b, c, d = st.columns(4)
-    a.metric("Total votes", stats["total"])
+    a.metric("User reports", stats["total"])
     b.metric("👍", stats["up"])
-    c.metric("Thumbs-up rate", "—" if stats["thumbs_up_rate"] is None else f"{stats['thumbs_up_rate']:.0f}%")
+    c.metric("User-rated accuracy", "—" if stats["thumbs_up_rate"] is None else f"{stats['thumbs_up_rate']:.0f}%")
     d.metric("Observed accuracy", "—" if stats["observed_accuracy"] is None else f"{stats['observed_accuracy']:.0f}%")
 
     last = st.session_state.get("last_result")
