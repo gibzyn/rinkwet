@@ -19,6 +19,96 @@ from google.oauth2.service_account import Credentials
 # ----------------------------
 st.set_page_config(page_title="RinkWet", page_icon="🏒", layout="centered")
 
+# ----------------------------
+# App header (App Store polished)
+# ----------------------------
+st.markdown(
+    """
+    <style>
+      /* App header polish */
+      .rw-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 12px 14px;
+        margin: 6px 0 14px 0;
+        border: 1px solid rgba(49, 51, 63, 0.14);
+        border-radius: 18px;
+        background: linear-gradient(180deg, rgba(240,242,246,0.75), rgba(240,242,246,0.25));
+      }
+      .rw-brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+      .rw-icon {
+        width: 46px;
+        height: 46px;
+        border-radius: 14px;
+        display: grid;
+        place-items: center;
+        border: 1px solid rgba(49, 51, 63, 0.18);
+        background: white;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.06);
+        flex: 0 0 auto;
+        font-size: 24px;
+      }
+      .rw-title-wrap { min-width: 0; }
+      .rw-title {
+        margin: 0;
+        font-size: 26px;
+        line-height: 1.05;
+        letter-spacing: -0.02em;
+      }
+      .rw-subtitle {
+        margin: 2px 0 0 0;
+        font-size: 13px;
+        color: rgba(49, 51, 63, 0.72);
+        line-height: 1.25;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .rw-badges {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 0 0 auto;
+      }
+      .rw-badge {
+        font-size: 12px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(49, 51, 63, 0.14);
+        background: rgba(255,255,255,0.8);
+      }
+      @media (max-width: 680px) {
+        .rw-badges { display: none; }
+        .rw-title { font-size: 24px; }
+      }
+    </style>
+
+    <div class="rw-header">
+      <div class="rw-brand">
+        <div class="rw-icon">🏒</div>
+        <div class="rw-title-wrap">
+          <h1 class="rw-title">RinkWet</h1>
+          <p class="rw-subtitle">Wet/Dry forecast for outdoor inline rinks — fast read first, details on demand.</p>
+        </div>
+      </div>
+      <div class="rw-badges">
+        <span class="rw-badge">Live weather</span>
+        <span class="rw-badge">Dew + drying model</span>
+        <span class="rw-badge">7‑day outlook</span>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 
 # ----------------------------
 # Defaults
