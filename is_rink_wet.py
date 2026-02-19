@@ -1177,8 +1177,9 @@ def render_last_check_ui():
     if st.button("Find next driest window"):
         window = ui.get("window_items") or []
         if not window:
-            with right:
-    st.caption(f"**Version:** {APP_VERSION}")
+        st.info("No forecast window available.")
+        else:
+
 
 st.caption("Weather-based estimate for wet rink conditions (dew/condensation + recent rain + wind).")
 
@@ -1792,3 +1793,4 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, surface material, or microclimate. Use at your own risk."
 )
+
