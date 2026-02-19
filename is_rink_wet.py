@@ -1172,16 +1172,38 @@ def render_last_check_ui():
     if ui.get("window_scores"):
         st.subheader("📈 Next 12 hours risk trend")
         st.line_chart({"Wet risk (0–100)": ui["window_scores"]})
-
     st.subheader("🕒 When will it be driest?")
     if st.button("Find next driest window"):
         window = ui.get("window_items") or []
         if not window:
-        st.info("No forecast window available.")
+            st.info("No forecast window available.")
         else:
+            # Lowest-average 2-hour window (simple + easy to read)
+            best = None  # (avg_score, start_idx)
+            for i in range(0, len(window) - 1):
+                try:
+                    s0 = float(window[i].get("score"))
+                    s1 = float(window[i + 1].get("score"))
+                except Exception:
+                    continue
+                avg2 = (s0 + s1) / 2.0
+                if best is None or avg2 < best[0]:
+                    best = (avg2, i)
 
+            if best is None:
+                st.info("Couldn’t compute a driest window from the forecast data.")
+            else:
+                avg2, i0 = best
+                dt0 = window[i0]["dt"]
+                dt1 = window[i0 + 1]["dt"]
+                st.success(
+                    f"Best 2-hour window: **{dt0.strftime('%a %-I:%M %p')}–{dt1.strftime('%-I:%M %p')}** "
+                    f"(avg risk **{avg2:.0f}/100**)"
+                )
+                for j in (i0, i0 + 1):
+                    w = window[j]
+                    st.write(f"- {w['dt'].strftime('%a %-I:%M %p')}: **{w['verdict']}** (Risk: {w['score']}/100)")
 
-st.caption("Weather-based estimate for wet rink conditions (dew/condensation + recent rain + wind).")
 
 # Session state init
 if "last_result" not in st.session_state:
@@ -1536,22 +1558,20 @@ if st.button("Check"):
             is_day=is_day_now,
             matched_time_delta_minutes=delta_now_min,
             surface_type=surface_type,
-
-
-# Post-adjustments (global calibration + night slab proxy + marine layer) for NOW
-score_now_adj, adj_notes_now = apply_post_adjustments(
-    base_score=int(score_now),
-    local_dt=datetime.now(tz_loc),
-    temp_f=temp_f_now,
-    dew_f=dew_f_now,
-    rh=rh_now,
-    wind_mph=wind_mph_now,
-    cloud_pct=cloud_now,
-    wind_dir_deg=wind_dir_now,
-)
-score_now = score_now_adj
         )
 
+        # Post-adjustments (global calibration + night slab proxy + marine layer) for NOW
+        score_now, _adj_notes_now = apply_post_adjustments(
+            base_score=int(score_now),
+            local_dt=datetime.now(tz_loc),
+            temp_f=temp_f_now,
+            dew_f=dew_f_now,
+            rh=rh_now,
+            wind_mph=wind_mph_now,
+            cloud_pct=cloud_now,
+            wind_dir_deg=wind_dir_now,
+        )
+        verdict_now = verdict_from_score(int(score_now))
         now_conf = compute_confidence(delta_now_min, dew_source_now, precip_now_15 is not None)
 
         # TARGET
@@ -1587,26 +1607,25 @@ score_now = score_now_adj
             is_day=is_day_t,
             matched_time_delta_minutes=delta_t_min,
             surface_type=surface_type,
-
-
-# Post-adjustments (global calibration + night slab proxy + marine layer) for TARGET
-score_t_adj, adj_notes_t = apply_post_adjustments(
-    base_score=int(score_t),
-    local_dt=target_dt,
-    temp_f=temp_f_t,
-    dew_f=dew_f_t,
-    rh=rh_t,
-    wind_mph=wind_mph_t,
-    cloud_pct=cloud_t,
-    wind_dir_deg=wind_dir_t,
-)
-score_t = score_t_adj
-# Surface adjustment notes for transparency/debug
-if adj_notes_t:
-    reasons_t.setdefault("Night / marine adjustments", [])
-    reasons_t["Night / marine adjustments"].extend(adj_notes_t)
         )
 
+        # Post-adjustments (global calibration + night slab proxy + marine layer) for TARGET
+        score_t, adj_notes_t = apply_post_adjustments(
+            base_score=int(score_t),
+            local_dt=target_dt,
+            temp_f=temp_f_t,
+            dew_f=dew_f_t,
+            rh=rh_t,
+            wind_mph=wind_mph_t,
+            cloud_pct=cloud_t,
+            wind_dir_deg=wind_dir_t,
+        )
+        verdict_t = verdict_from_score(int(score_t))
+
+        # Surface adjustment notes for transparency/debug
+        if adj_notes_t:
+            reasons_t.setdefault("Night / marine adjustments", [])
+            reasons_t["Night / marine adjustments"].extend(adj_notes_t)
         if precip_last1h is not None:
             reasons_t["Rain / recent moisture"].insert(
                 0, f"Target-hour precipitation bucket: {precip_last1h:.2f} mm (preceding 1 hour sum)."
@@ -1793,4 +1812,3 @@ st.caption(
     "Disclaimer: This app provides a weather-based estimate only. Surface conditions may differ due to irrigation, "
     "shade, drainage, surface material, or microclimate. Use at your own risk."
 )
-
